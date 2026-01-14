@@ -1,0 +1,11 @@
+id,name,age,department,salary,years_experience,performance_score
+1,Alice,29,Engineering,85000,5,4.6
+2,Bob,35,Engineering,92000,8,4.2
+3,Charlie,41,HR,65000,10,3.9
+4,Diana,26,Marketing,58000,2,4.8
+5,Evan,38,Marketing,72000,9,4.1
+6,Fiona,31,HR,67000,6,4.3
+7,George,45,Engineering,110000,20,4.7
+8,Hannah,28,Sales,60000,3,3.8
+9,Ian,34,Sales,68000,7,4.0
+10,Jenny,24,Engineering,70000,1,4.5
