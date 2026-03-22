@@ -1,104 +1,140 @@
-import pandas as pd
 import numpy as np
 import lightkurve as lk
 import matplotlib.pyplot as plt
 from astropy.timeseries import BoxLeastSquares
+import joblib
+import os
+import time
 
-def searchSector(lc):
-    lc_clean = lc.remove_outliers(sigma=5)
-    lc_flat = lc_clean.flatten(window_length=401)
+CLASSIFIER_PATH = "exoplanet_rf_classifier.joblib"
 
-    periods = np.linspace(0.5, 20, 10000)
-    bls = BoxLeastSquares(lc_flat.time.value, lc_flat.flux.value)
+# Fine grid for inference — accurate single-target results
+BLS_PERIODS   = np.linspace(0.5, 20, 10000)
+BLS_DURATIONS = np.linspace(0.02, 0.3, 20)
 
-    power = bls.power(periods, np.linspace(0.02, 0.3, 20))
+# Feature order must exactly match train_classifier.py
+FEATURE_NAMES = [
+    "bls_period", "bls_duration", "bls_depth", "bls_snr", "bls_period_std",
+    "depth_over_duration",
+    "toi_period", "toi_depth", "toi_duration", "n_sectors",
+]
 
-    best_index = np.argmax(power.power)
-    best_period = power.period[best_index]
 
-    best_duration = power.duration[best_index]
-    best_t0 = power.transit_time[best_index]
-    best_depth = power.depth[best_index]
+def run_bls_on_lc(lc):
+    """Run BLS on a single normalised light curve, return feature dict."""
+    lc_clean = lc.remove_nans().remove_outliers(sigma=5).flatten(window_length=401).normalize()
 
-    print('orbital period - ' + str(best_period)) #hot jupiter = 1-5, super earth 5-20
-    print('orbital time - ' + str(best_duration))
-    print('first time it passed the star - ' + str(best_t0))
-    print('fractional drop in brightness - ' + str(best_depth * 100) + '%')
+    bls   = BoxLeastSquares(lc_clean.time.value, lc_clean.flux.value)
+    power = bls.power(BLS_PERIODS, BLS_DURATIONS)
 
-    lc_folded = lc_flat.fold(period=best_period, epoch_time=best_t0)
-    lc_folded.plot()
+    best_index    = np.argmax(power.power)
+    best_period   = float(power.period[best_index])
+    best_duration = float(power.duration[best_index])
+    best_t0       = float(power.transit_time[best_index])
+    best_depth    = float(power.depth[best_index])
+    bls_snr       = float(power.power[best_index] / (np.median(power.power) + 1e-9))
 
-    if checkFoldedCurve(lc_folded):
-        print(planetValidation(best_index, best_period, best_duration, best_t0, best_depth, lc_flat))
+    return {
+        "period":   best_period,
+        "duration": best_duration,
+        "depth":    best_depth,
+        "t0":       best_t0,
+        "snr":      bls_snr,
+        "lc_clean": lc_clean,
+    }
+
+
+def searchSector(tic_id: str):
+    print(f"\nSearching TIC {tic_id}...")
+
+    search = lk.search_lightcurve(f"TIC {tic_id}", mission="TESS", author="SPOC")
+    if search is None or len(search) == 0:
+        print("No SPOC data. Trying any pipeline...")
+        search = lk.search_lightcurve(f"TIC {tic_id}", mission="TESS")
+    if search is None or len(search) == 0:
+        print(f"ERROR: No light curves found for TIC {tic_id}.")
+        return
+
+    n_sectors = len(search)
+    print(f"Found {n_sectors} sector(s). Running BLS on up to 3...\n")
+
+    # ── Run BLS on up to 3 sectors and average (mirrors train_classifier.py) ──
+    sector_results = []
+    for i in range(min(3, n_sectors)):
+        sector_num = int(search.table["sequence_number"][i])
+        print(f"  Sector {sector_num}...")
+        try:
+            lc = search[i].download(quality_bitmask="hard")
+            if lc is None:
+                continue
+            r = run_bls_on_lc(lc)
+            sector_results.append(r)
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"    Skipped sector {sector_num}: {e}")
+
+    if not sector_results:
+        print("ERROR: BLS failed on all sectors.")
+        return
+
+    # Average across sectors
+    best_period   = float(np.mean([r["period"]   for r in sector_results]))
+    best_duration = float(np.mean([r["duration"] for r in sector_results]))
+    best_depth    = float(np.mean([r["depth"]    for r in sector_results]))
+    bls_snr       = float(np.mean([r["snr"]      for r in sector_results]))
+    period_std    = float(np.std( [r["period"]   for r in sector_results])) if len(sector_results) > 1 else 0.0
+    best_t0       = float(sector_results[0]["t0"])
+    depth_over_dur = best_depth / (best_duration + 1e-6)
+
+    print(f"\n── BLS Results ({len(sector_results)} sector(s) averaged) ────────────────")
+    print(f"  Orbital period     : {best_period:.4f} days")
+    print(f"  Period std         : {period_std:.4f} days  (low = stable signal)")
+    print(f"  Transit duration   : {best_duration:.4f} days")
+    print(f"  Fractional depth   : {best_depth * 100:.4f}%")
+    print(f"  BLS SNR (proxy)    : {bls_snr:.2f}")
+    print(f"  Depth/duration     : {depth_over_dur:.4f}")
+
+    # ── Fold and plot using first sector's cleaned LC ─────────────────────────
+    lc_folded = sector_results[0]["lc_clean"].fold(period=best_period, epoch_time=best_t0)
+    lc_folded.plot(title=f"TIC {tic_id}  |  P={best_period:.3f}d  depth={best_depth*100:.3f}%  SNR={bls_snr:.1f}")
+
+    # ── Classify ──────────────────────────────────────────────────────────────
+    if not os.path.exists(CLASSIFIER_PATH):
+        print(f"\n[WARNING] Classifier not found at '{CLASSIFIER_PATH}'.")
+        print("Run train_classifier.py first.")
+        plt.show()
+        return
+
+    clf = joblib.load(CLASSIFIER_PATH)
+
+    # Feature order must match FEATURE_NAMES / train_classifier.py exactly
+    features = np.array([[
+        best_period,       # bls_period
+        best_duration,     # bls_duration
+        best_depth,        # bls_depth
+        bls_snr,           # bls_snr
+        period_std,        # bls_period_std
+        depth_over_dur,    # depth_over_duration
+        best_period,       # toi_period  (proxy — no TOI table at inference time)
+        best_depth,        # toi_depth   (proxy)
+        best_duration,     # toi_duration (proxy)
+        float(n_sectors),  # n_sectors
+    ]])
+
+    prediction  = clf.predict(features)[0]
+    probability = clf.predict_proba(features)[0]
+
+    label_map = {0: "❌  Not a planet (False Positive)", 1: "✅  Planet candidate"}
+    print(f"\n── Classifier Result ─────────────────────────────────")
+    print(f"  Prediction  : {label_map[prediction]}")
+    print(f"  Confidence  : planet={probability[1]:.2%}  |  non-planet={probability[0]:.2%}")
+    print(f"──────────────────────────────────────────────────────")
 
     plt.show()
 
 
+# ── Entry point ───────────────────────────────────────────────────────────────
+# Change TIC_ID to test any target
+TIC_ID = "307210830"
 
-def planetValidation(index, period, duration, t0, depth, lc_flat):
-
-    time = lc_flat.time.value
-    flux = lc_flat.flux.valu
-    phase = ((time - t0 + 0.5 * period) % period) - 0.5 * period        # (Where is each datapoint relative to the center of transit)
-    in_transit = np.abs(phase) < duration / 2                           # Boolean mask to mark true if datapoint is inside the transit
-                                                                        # /2 so that you're centered around the middle of transit,
-    out_transit = np.abs(phase) > duration                              # Boolean mask to mark false if not in the transit
-    transit_number = np.floor((time - t0) / period)                     # assign a number to mark what part of transit (0 = 1st transit, 1 = 2nd, 2 = 3rd)
-
-
-    # Measure each transit independently, depths[] to store each transit depth
-    depths = []
-    for n in np.unique(transit_number):
-        mask = transit_number == n
-
-        # Skip weakly masked transits
-        if np.sum(mask & in_transit) < 5:
-            continue
-
-        #measure transit depth, out_transit = baseline brightness, in_transit = dimmed brightness
-        depth = np.median(flux[mask & out_transit]) - np.median(flux[mask & in_transit])
-        depths.append(depth)
-    depths = np.array(depths)
-
-    std = depths.std() / depths.mean()
-
-    if depths.mean() > 0.025:
-        isPlanet = False
-        return isPlanet
-
-    print(std)
-    if std > 0.3:
-        print(std)
-        return [False, 'Instrument Failure']
-    elif 0.3 >= std > 0.2:
-        std = 'suspicious'
-    elif 0.2 >= std > 0.1:
-        std = 'acceptable'
-    elif 0.1 >= std > 0:
-        std = 'likely'
-    else:
-        return -1
-
-
-    planetRadius = np.sqrt(depths.mean())
-    print("Mean depth:", depths.mean())
-    print("Std depth:", depths.std())
-
-    odd = depths[::2]
-    even = depths[1::2]
-
-    if abs(np.mean(odd) - np.mean(even)) / depths.mean() > 0.10:
-        return [False, 'Most Likely a Binary Star']
-
-    planetRadius = np.sqrt(depths.mean())
-
-    return [float(planetRadius), depth, std, planetRadius]
-
-
-def checkFoldedCurve(folded):
-    return True
-
-
-lc = lk.search_lightcurve("TIC 307210830", mission="TESS").download()
-
-searchSector(lc)
+searchSector(TIC_ID)
