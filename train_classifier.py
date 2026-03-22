@@ -90,7 +90,7 @@ def run_bls_single_sector(tic_id: str, sector: int) -> dict | None:
         if results is None or len(results) == 0:
             return None
 
-        lc = results[0].download(quality_bitmask="hard")
+        lc = results[0].download(quality_bitmask="default")
         if lc is None:
             return None
 

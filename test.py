@@ -64,7 +64,7 @@ def searchSector(tic_id: str):
         sector_num = int(search.table["sequence_number"][i])
         print(f"  Sector {sector_num}...")
         try:
-            lc = search[i].download(quality_bitmask="hard")
+            lc = search[i].download(quality_bitmask="default")
             if lc is None:
                 continue
             r = run_bls_on_lc(lc)
