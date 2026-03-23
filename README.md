@@ -45,7 +45,7 @@ pip install -r requirements.txt
 2. python3 test.py tic_id
 ```
 
-
+#To retrain the model with your own parameters
 ```bash
 # Make the pipeline script executable (once)
 chmod +x run_pipeline.sh
