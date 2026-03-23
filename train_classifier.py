@@ -1,48 +1,21 @@
 """
-train_classifier.py
-───────────────────
-Trains a Random Forest + Gradient Boosting classifier ensemble to distinguish
-genuine exoplanet transits from false positives using REAL BLS features
-extracted from TESS light curves.
-
-Improvements over v1
-────────────────────
-  1. More targets supported — fetch with --max-targets 1000+
-  2. Derived feature: depth_over_duration (sharper signal for real transits)
-  3. Both RF and GradientBoosting trained and compared — best one saved
-  4. BLS averaged across ALL available sectors per target (not just sector[0])
-
-Feature extraction
+Features
 ──────────────────
-  bls_period          – mean best BLS period across sectors (days)
-  bls_duration        – mean best transit duration across sectors (days)
-  bls_depth           – mean fractional flux drop across sectors
-  bls_snr             – mean signal-to-noise across sectors
-  bls_period_std      – std of period across sectors (stable = low std)
-  depth_over_duration – bls_depth / bls_duration (sharpness proxy)
-  toi_period          – period from TOI table (days)
-  toi_depth           – depth from TOI table (fractional)
-  toi_duration        – duration from TOI table (days)
-  n_sectors           – number of sectors available
+  bls_period          mean best BLS period across sectors (days)
+  bls_duration        mean best transit duration across sectors (days)
+  bls_depth           mean fractional flux drop across sectors
+  bls_snr             mean signal-to-noise across sectors
+  bls_period_std      std of period across sectors (stable = low std)
+  depth_over_duration bls_depth / bls_duration (sharpness proxy)
+  toi_period          period from TOI table (days)
+  toi_depth           depth from TOI table (fractional)
+  toi_duration        duration from TOI table (days)
+  n_sectors           number of sectors available
 
 Labels
 ──────
   1 = confirmed / known planet
   0 = false positive
-
-Outputs
-───────
-  exoplanet_rf_classifier.joblib  – best model (RF or GBT, whichever scores higher)
-
-Requirements
-────────────
-  pip install lightkurve pandas numpy scikit-learn joblib requests astroquery
-
-Usage
-─────
-  python train_classifier.py --csv labeled_tess_dataset.csv
-  python train_classifier.py --csv labeled_tess_dataset.csv --max-targets 200
-  python train_classifier.py --csv labeled_tess_dataset.csv --toi-only
 """
 
 import argparse
@@ -54,6 +27,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from astropy.timeseries import BoxLeastSquares
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import classification_report, confusion_matrix
@@ -76,11 +50,43 @@ MAX_SECTORS_PER_TARGET = 3
 
 # ── Feature extraction ────────────────────────────────────────────────────────
 
+FLATTEN_WINDOW = 401  # Must match test.py
+
+
+def compute_extra_features(lc_time, lc_flux, period, t0, duration):
+    half_dur = duration / 2.0
+
+    # ── Even / odd depth ──────────────────────────────────────────────────────
+    phase       = ((lc_time - t0) % period) / period   # 0..1
+    in_transit  = (phase < half_dur / period) | (phase > 1 - half_dur / period)
+    transit_num = np.floor((lc_time - t0) / period).astype(int)
+
+    even_depths, odd_depths = [], []
+    for tn in np.unique(transit_num[in_transit]):
+        mask  = in_transit & (transit_num == tn)
+        if mask.sum() < 3:
+            continue
+        depth = 1.0 - float(np.median(lc_flux[mask]))
+        (even_depths if tn % 2 == 0 else odd_depths).append(depth)
+
+    if even_depths and odd_depths:
+        even_odd_diff = abs(np.mean(even_depths) - np.mean(odd_depths))
+    else:
+        even_odd_diff = 0.0
+
+    # ── Secondary eclipse power ───────────────────────────────────────────────
+    t0_secondary = t0 + period / 2.0
+    try:
+        bls_sec   = BoxLeastSquares(lc_time, lc_flux)
+        power_sec = bls_sec.power([period], [duration])
+        sec_power = float(power_sec.power[0] / (np.median(power_sec.power) + 1e-9))
+    except Exception:
+        sec_power = 0.0
+
+    return float(even_odd_diff), float(sec_power)
+
+
 def run_bls_single_sector(tic_id: str, sector: int) -> dict | None:
-    """
-    Download the SPOC light curve for one sector and run BLS.
-    Returns a dict of BLS features, or None on failure.
-    """
     try:
         import lightkurve as lk
 
@@ -94,20 +100,33 @@ def run_bls_single_sector(tic_id: str, sector: int) -> dict | None:
         if lc is None:
             return None
 
-        lc = lc.remove_nans().remove_outliers(sigma=5).normalize()
+        lc = lc.remove_nans().remove_outliers(sigma=5).flatten(window_length=FLATTEN_WINDOW).normalize()
 
         bls = lc.to_periodogram(method="bls", period=BLS_PERIODS, duration=BLS_DURATIONS)
 
         best_period   = float(bls.period_at_max_power.value)
         best_duration = float(bls.duration_at_max_power.value)
         best_depth    = float(bls.depth_at_max_power.value)
+        best_t0       = float(bls.transit_time_at_max_power.value)
         snr           = float(bls.snr.max())
 
+        # Count transits: how many full periods fit in the timespan
+        timespan      = float(lc.time.value[-1] - lc.time.value[0])
+        transit_count = max(1, int(timespan / best_period))
+
+        even_odd_diff, sec_power = compute_extra_features(
+            lc.time.value, lc.flux.value,
+            best_period, best_t0, best_duration
+        )
+
         return {
-            "bls_period":   best_period,
-            "bls_duration": best_duration,
-            "bls_depth":    best_depth,
-            "bls_snr":      snr,
+            "bls_period":         best_period,
+            "bls_duration":       best_duration,
+            "bls_depth":          best_depth,
+            "bls_snr":            snr,
+            "transit_count":      transit_count,
+            "even_odd_depth_diff": even_odd_diff,
+            "secondary_eclipse_power": sec_power,
         }
     except Exception:
         return None
@@ -132,12 +151,15 @@ def run_bls_all_sectors(tic_id: str, sectors: list) -> dict | None:
         return None
 
     avg = {
-        "bls_period":     float(np.mean([r["bls_period"]   for r in results])),
-        "bls_duration":   float(np.mean([r["bls_duration"] for r in results])),
-        "bls_depth":      float(np.mean([r["bls_depth"]    for r in results])),
-        "bls_snr":        float(np.mean([r["bls_snr"]      for r in results])),
+        "bls_period":              float(np.mean([r["bls_period"]              for r in results])),
+        "bls_duration":            float(np.mean([r["bls_duration"]            for r in results])),
+        "bls_depth":               float(np.mean([r["bls_depth"]               for r in results])),
+        "bls_snr":                 float(np.mean([r["bls_snr"]                 for r in results])),
         # Std of period across sectors — real planets are consistent, FPs vary
-        "bls_period_std": float(np.std([r["bls_period"]    for r in results])) if len(results) > 1 else 0.0,
+        "bls_period_std":          float(np.std( [r["bls_period"]              for r in results])) if len(results) > 1 else 0.0,
+        "transit_count":           float(np.mean([r["transit_count"]           for r in results])),
+        "even_odd_depth_diff":     float(np.mean([r["even_odd_depth_diff"]     for r in results])),
+        "secondary_eclipse_power": float(np.mean([r["secondary_eclipse_power"] for r in results])),
     }
     return avg
 
@@ -147,37 +169,41 @@ def extract_features_for_row(row: pd.Series, use_bls: bool) -> dict:
     Build a feature dict for one TIC target.
     Averages BLS over all available sectors. Falls back to TOI values on failure.
     """
-    tic_id    = str(row["TIC_ID"])
-    sectors   = ast.literal_eval(str(row["sectors"])) if "sectors" in row and pd.notna(row.get("sectors")) else []
-    n_sectors = int(row.get("n_sectors", len(sectors)))
+    tic_id  = str(row["TIC_ID"])
+    sectors = ast.literal_eval(str(row["sectors"])) if "sectors" in row and pd.notna(row.get("sectors")) else []
 
     toi_period   = float(row["period"])            if "period"      in row and pd.notna(row.get("period"))      else np.nan
     toi_depth    = float(row["depth_ppm"]) / 1e6   if "depth_ppm"   in row and pd.notna(row.get("depth_ppm"))   else np.nan
     toi_duration = float(row["duration_hr"]) / 24  if "duration_hr" in row and pd.notna(row.get("duration_hr")) else np.nan
 
     feat = {
-        "bls_period":          np.nan,
-        "bls_duration":        np.nan,
-        "bls_depth":           np.nan,
-        "bls_snr":             np.nan,
-        "bls_period_std":      np.nan,
-        "depth_over_duration": np.nan,
-        "toi_period":          toi_period,
-        "toi_depth":           toi_depth,
-        "toi_duration":        toi_duration,
-        "n_sectors":           n_sectors,
+        "bls_period":              np.nan,
+        "bls_duration":            np.nan,
+        "bls_depth":               np.nan,
+        "bls_snr":                 np.nan,
+        "bls_period_std":          np.nan,
+        "depth_over_duration":     np.nan,
+        "transit_count":           np.nan,
+        "even_odd_depth_diff":     np.nan,
+        "secondary_eclipse_power": np.nan,
+        "toi_period":              toi_period,
+        "toi_depth":               toi_depth,
+        "toi_duration":            toi_duration,
     }
 
     if use_bls and sectors:
         bls = run_bls_all_sectors(tic_id, sectors)
         if bls:
             feat.update({
-                "bls_period":          bls["bls_period"],
-                "bls_duration":        bls["bls_duration"],
-                "bls_depth":           bls["bls_depth"],
-                "bls_snr":             bls["bls_snr"],
-                "bls_period_std":      bls["bls_period_std"],
-                "depth_over_duration": bls["bls_depth"] / (bls["bls_duration"] + 1e-6),
+                "bls_period":              bls["bls_period"],
+                "bls_duration":            bls["bls_duration"],
+                "bls_depth":               bls["bls_depth"],
+                "bls_snr":                 bls["bls_snr"],
+                "bls_period_std":          bls["bls_period_std"],
+                "depth_over_duration":     bls["bls_depth"] / (bls["bls_duration"] + 1e-6),
+                "transit_count":           bls["transit_count"],
+                "even_odd_depth_diff":     bls["even_odd_depth_diff"],
+                "secondary_eclipse_power": bls["secondary_eclipse_power"],
             })
 
     return feat
@@ -215,7 +241,8 @@ def build_feature_matrix(df: pd.DataFrame, use_bls: bool):
     feature_names = [
         "bls_period", "bls_duration", "bls_depth", "bls_snr", "bls_period_std",
         "depth_over_duration",
-        "toi_period", "toi_depth", "toi_duration", "n_sectors",
+        "transit_count", "even_odd_depth_diff", "secondary_eclipse_power",
+        "toi_period", "toi_depth", "toi_duration",
     ]
 
     X = np.array([[row[f] for f in feature_names] for row in feature_rows])

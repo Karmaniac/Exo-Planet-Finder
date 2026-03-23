@@ -4,17 +4,11 @@ fetch_tess_labeled_dataset.py
 Downloads the ExoFOP-TESS TOI table, filters to confirmed planets (CP/KP)
 and false positives (FP), then fetches available TESS sectors for each TIC ID.
 
-Output: labeled_tess_dataset.csv
-Columns: TIC_ID, label (1=planet, 0=false positive), sectors (list), period, depth, duration
-
-Requirements:
-    pip install lightkurve pandas requests astroquery
-
 Usage:
     python fetch_tess_labeled_dataset.py
 
     Optional flags:
-        --max-targets 500        # limit how many targets to query (default: all)
+        --max-targets n        # limit how many targets to query (default: all)
         --output my_dataset.csv  # custom output filename
 """
 

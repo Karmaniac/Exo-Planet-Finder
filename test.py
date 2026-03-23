@@ -5,6 +5,7 @@ from astropy.timeseries import BoxLeastSquares
 import joblib
 import os
 import time
+import argparse
 
 CLASSIFIER_PATH = "exoplanet_rf_classifier.joblib"
 
@@ -16,13 +17,58 @@ BLS_DURATIONS = np.linspace(0.02, 0.3, 20)
 FEATURE_NAMES = [
     "bls_period", "bls_duration", "bls_depth", "bls_snr", "bls_period_std",
     "depth_over_duration",
-    "toi_period", "toi_depth", "toi_duration", "n_sectors",
+    "transit_count", "even_odd_depth_diff", "secondary_eclipse_power",
+    "toi_period", "toi_depth", "toi_duration",
 ]
 
 
+FLATTEN_WINDOW = 401  # Must match train_classifier.py
+
+
+def preprocess_lc(lc):
+    """Shared preprocessing — must stay identical to train_classifier.py."""
+    return lc.remove_nans().remove_outliers(sigma=5).flatten(window_length=FLATTEN_WINDOW).normalize()
+
+
+def compute_extra_features(lc_time, lc_flux, period, t0, duration):
+    """
+    Compute even/odd depth difference and secondary eclipse power.
+    Must stay identical to train_classifier.py.
+    """
+    half_dur = duration / 2.0
+
+    # ── Even / odd depth ──────────────────────────────────────────────────────
+    phase       = ((lc_time - t0) % period) / period
+    in_transit  = (phase < half_dur / period) | (phase > 1 - half_dur / period)
+    transit_num = np.floor((lc_time - t0) / period).astype(int)
+
+    even_depths, odd_depths = [], []
+    for tn in np.unique(transit_num[in_transit]):
+        mask = in_transit & (transit_num == tn)
+        if mask.sum() < 3:
+            continue
+        depth = 1.0 - float(np.median(lc_flux[mask]))
+        (even_depths if tn % 2 == 0 else odd_depths).append(depth)
+
+    if even_depths and odd_depths:
+        even_odd_diff = abs(np.mean(even_depths) - np.mean(odd_depths))
+    else:
+        even_odd_diff = 0.0
+
+    # ── Secondary eclipse power ───────────────────────────────────────────────
+    try:
+        bls_sec   = BoxLeastSquares(lc_time, lc_flux)
+        power_sec = bls_sec.power([period], [duration])
+        sec_power = float(power_sec.power[0] / (np.median(power_sec.power) + 1e-9))
+    except Exception:
+        sec_power = 0.0
+
+    return float(even_odd_diff), float(sec_power)
+
+
 def run_bls_on_lc(lc):
-    """Run BLS on a single normalised light curve, return feature dict."""
-    lc_clean = lc.remove_nans().remove_outliers(sigma=5).flatten(window_length=401).normalize()
+    """Run BLS on a single preprocessed light curve, return feature dict."""
+    lc_clean = preprocess_lc(lc)
 
     bls   = BoxLeastSquares(lc_clean.time.value, lc_clean.flux.value)
     power = bls.power(BLS_PERIODS, BLS_DURATIONS)
@@ -34,13 +80,24 @@ def run_bls_on_lc(lc):
     best_depth    = float(power.depth[best_index])
     bls_snr       = float(power.power[best_index] / (np.median(power.power) + 1e-9))
 
+    timespan      = float(lc_clean.time.value[-1] - lc_clean.time.value[0])
+    transit_count = max(1, int(timespan / best_period))
+
+    even_odd_diff, sec_power = compute_extra_features(
+        lc_clean.time.value, lc_clean.flux.value,
+        best_period, best_t0, best_duration
+    )
+
     return {
-        "period":   best_period,
-        "duration": best_duration,
-        "depth":    best_depth,
-        "t0":       best_t0,
-        "snr":      bls_snr,
-        "lc_clean": lc_clean,
+        "period":                  best_period,
+        "duration":                best_duration,
+        "depth":                   best_depth,
+        "t0":                      best_t0,
+        "snr":                     bls_snr,
+        "transit_count":           transit_count,
+        "even_odd_depth_diff":     even_odd_diff,
+        "secondary_eclipse_power": sec_power,
+        "lc_clean":                lc_clean,
     }
 
 
@@ -78,21 +135,27 @@ def searchSector(tic_id: str):
         return
 
     # Average across sectors
-    best_period   = float(np.mean([r["period"]   for r in sector_results]))
-    best_duration = float(np.mean([r["duration"] for r in sector_results]))
-    best_depth    = float(np.mean([r["depth"]    for r in sector_results]))
-    bls_snr       = float(np.mean([r["snr"]      for r in sector_results]))
-    period_std    = float(np.std( [r["period"]   for r in sector_results])) if len(sector_results) > 1 else 0.0
-    best_t0       = float(sector_results[0]["t0"])
+    best_period    = float(np.mean([r["period"]                  for r in sector_results]))
+    best_duration  = float(np.mean([r["duration"]                for r in sector_results]))
+    best_depth     = float(np.mean([r["depth"]                   for r in sector_results]))
+    bls_snr        = float(np.mean([r["snr"]                     for r in sector_results]))
+    period_std     = float(np.std( [r["period"]                  for r in sector_results])) if len(sector_results) > 1 else 0.0
+    transit_count  = float(np.mean([r["transit_count"]           for r in sector_results]))
+    even_odd_diff  = float(np.mean([r["even_odd_depth_diff"]     for r in sector_results]))
+    sec_power      = float(np.mean([r["secondary_eclipse_power"] for r in sector_results]))
+    best_t0        = float(sector_results[0]["t0"])
     depth_over_dur = best_depth / (best_duration + 1e-6)
 
     print(f"\n── BLS Results ({len(sector_results)} sector(s) averaged) ────────────────")
-    print(f"  Orbital period     : {best_period:.4f} days")
-    print(f"  Period std         : {period_std:.4f} days  (low = stable signal)")
-    print(f"  Transit duration   : {best_duration:.4f} days")
-    print(f"  Fractional depth   : {best_depth * 100:.4f}%")
-    print(f"  BLS SNR (proxy)    : {bls_snr:.2f}")
-    print(f"  Depth/duration     : {depth_over_dur:.4f}")
+    print(f"  Orbital period         : {best_period:.4f} days")
+    print(f"  Period std             : {period_std:.4f} days  (low = stable signal)")
+    print(f"  Transit duration       : {best_duration:.4f} days")
+    print(f"  Fractional depth       : {best_depth * 100:.4f}%")
+    print(f"  BLS SNR (proxy)        : {bls_snr:.2f}")
+    print(f"  Depth/duration         : {depth_over_dur:.4f}")
+    print(f"  Transit count          : {transit_count:.1f}")
+    print(f"  Even/odd depth diff    : {even_odd_diff:.6f}  (high = likely EB)")
+    print(f"  Secondary eclipse power: {sec_power:.2f}      (high = likely EB)")
 
     # ── Fold and plot using first sector's cleaned LC ─────────────────────────
     lc_folded = sector_results[0]["lc_clean"].fold(period=best_period, epoch_time=best_t0)
@@ -115,10 +178,12 @@ def searchSector(tic_id: str):
         bls_snr,           # bls_snr
         period_std,        # bls_period_std
         depth_over_dur,    # depth_over_duration
+        transit_count,     # transit_count
+        even_odd_diff,     # even_odd_depth_diff
+        sec_power,         # secondary_eclipse_power
         best_period,       # toi_period  (proxy — no TOI table at inference time)
         best_depth,        # toi_depth   (proxy)
         best_duration,     # toi_duration (proxy)
-        float(n_sectors),  # n_sectors
     ]])
 
     prediction  = clf.predict(features)[0]
@@ -134,7 +199,11 @@ def searchSector(tic_id: str):
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-# Change TIC_ID to test any target
-TIC_ID = "307210830"
+DEFAULT_TIC_ID = "231728511"  # Change this as your default target
 
-searchSector(TIC_ID)
+parser = argparse.ArgumentParser(description="Run BLS + classifier on a TESS TIC target.")
+parser.add_argument("tic_id", nargs="?", default=DEFAULT_TIC_ID,
+                    help=f"TIC ID to analyse (default: {DEFAULT_TIC_ID})")
+args = parser.parse_args()
+
+searchSector(args.tic_id)
