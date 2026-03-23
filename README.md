@@ -33,7 +33,7 @@ ExoPlanetFinder/
 ```bash
 python3 -m venv exoplanet
 source exoplanet/bin/activate
-pip install lightkurve pandas numpy scikit-learn joblib requests astroquery matplotlib
+pip install -r requirements.txt
 ```
 
 ---
