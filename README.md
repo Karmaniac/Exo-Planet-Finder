@@ -40,6 +40,12 @@ pip install -r requirements.txt
 
 ## Quick Start
 
+```Use Already Trained Model
+1. Activate \exoplanet venv
+2. python3 test.py tic_id
+```
+
+
 ```bash
 # Make the pipeline script executable (once)
 chmod +x run_pipeline.sh
