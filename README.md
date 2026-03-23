@@ -41,8 +41,10 @@ pip install -r requirements.txt
 ## Quick Start
 
 ```Use Already Trained Model
-1. Activate \exoplanet venv
-2. python3 test.py tic_id
+# Use your own tic_id found from tess
+source exoplanet/bin/activate
+python3 test.py tic_id
+deactivate
 ```
 
 #To retrain the model with your own parameters
