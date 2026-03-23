@@ -166,6 +166,8 @@ After training, the best model is saved to `exoplanet_rf_classifier.joblib`. The
 ---
 
 ## Changing the Test Target
+This is only used as a default TIC ID, and using the fetch/train pipeline
+afterwards the argument to test.py overwrites this
 
 Open `test.py` and change the last line:
 
