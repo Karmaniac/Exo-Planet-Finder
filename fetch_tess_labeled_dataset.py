@@ -1,16 +1,3 @@
-"""
-fetch_tess_labeled_dataset.py
--------------------------------
-Downloads the ExoFOP-TESS TOI table, filters to confirmed planets (CP/KP)
-and false positives (FP), then fetches available TESS sectors for each TIC ID.
-
-Usage:
-    python fetch_tess_labeled_dataset.py
-
-    Optional flags:
-        --max-targets n        # limit how many targets to query (default: all)
-        --output my_dataset.csv  # custom output filename
-"""
 
 import argparse
 import ast
