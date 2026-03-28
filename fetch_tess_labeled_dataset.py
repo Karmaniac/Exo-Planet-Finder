@@ -1,17 +1,3 @@
-"""
-fetch_tess_labeled_dataset.py
--------------------------------
-Downloads the ExoFOP-TESS TOI table, filters to confirmed planets (CP/KP)
-and false positives (FP), then fetches available TESS sectors for each TIC ID.
-
-Usage:
-    python fetch_tess_labeled_dataset.py
-
-    Optional flags:
-        --max-targets n        # limit how many targets to query (default: all)
-        --output my_dataset.csv  # custom output filename
-"""
-
 import argparse
 import ast
 import sys
@@ -153,8 +139,9 @@ def fetch_sectors_for_tic(tic_id: str, retries: int = 3) -> list:
                 return []
 
 
-def fetch_all_sectors(df: pd.DataFrame, max_targets: int = None) -> pd.DataFrame:
+def fetch_all_sectors(df: pd.DataFrame, max_targets: int = None, balance: bool = True) -> pd.DataFrame:
     if max_targets:
+        # Stratified subsample -- equal planets and FPs up to max_targets
         per_class = max_targets // 2
         planets = df[df["label"] == 1].sample(
             min(per_class, (df["label"] == 1).sum()), random_state=42
@@ -164,6 +151,21 @@ def fetch_all_sectors(df: pd.DataFrame, max_targets: int = None) -> pd.DataFrame
         )
         df = pd.concat([planets, fps]).sample(frac=1, random_state=42).reset_index(drop=True)
         print(f"Sampled {len(planets)} planets + {len(fps)} false positives = {len(df)} total targets.\n")
+    else:
+        # Full dataset -- all confirmed planets and false positives
+        counts = df["label"].value_counts()
+        print(f"Using full dataset:")
+        print(f"  Planets (1) : {counts.get(1, 0):,}")
+        print(f"  FPs     (0) : {counts.get(0, 0):,}")
+        print(f"  Total       : {len(df):,}")
+        if balance:
+            min_count = counts.min()
+            df = df.groupby("label", group_keys=False).apply(
+                lambda g: g.sample(min_count, random_state=42)
+            ).sample(frac=1, random_state=42).reset_index(drop=True)
+            print(f"  Balanced to : {len(df):,} ({min_count} per class)\n")
+        else:
+            print(f"  (Unbalanced -- using all records as-is)\n")
 
     total = len(df)
     sectors_list = []
@@ -201,6 +203,8 @@ def main():
                         help="Output CSV filename (default: labeled_tess_dataset.csv)")
     parser.add_argument("--skip-sectors", action="store_true",
                         help="Skip sector fetching (just save labels from TOI table)")
+    parser.add_argument("--no-balance", action="store_true",
+                        help="When fetching all records, do NOT downsample majority class (default: balance)")
     args = parser.parse_args()
 
     # 1. Download TOI table
@@ -215,7 +219,7 @@ def main():
         return
 
     # 3. Fetch sectors
-    final_df = fetch_all_sectors(labeled_df, max_targets=args.max_targets)
+    final_df = fetch_all_sectors(labeled_df, max_targets=args.max_targets, balance=not args.no_balance)
 
     # 4. Save
     final_df.to_csv(args.output, index=False)

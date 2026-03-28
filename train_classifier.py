@@ -1,301 +1,180 @@
 """
-Features
-──────────────────
-  bls_period          mean best BLS period across sectors (days)
-  bls_duration        mean best transit duration across sectors (days)
-  bls_depth           mean fractional flux drop across sectors
-  bls_snr             mean signal-to-noise across sectors
-  bls_period_std      std of period across sectors (stable = low std)
-  depth_over_duration bls_depth / bls_duration (sharpness proxy)
-  toi_period          period from TOI table (days)
-  toi_depth           depth from TOI table (fractional)
-  toi_duration        duration from TOI table (days)
-  n_sectors           number of sectors available
+train_classifier.py
+───────────────────
+1D CNN exoplanet transit classifier (Shallue & Vanderburg 2018 inspired).
 
-Labels
-──────
-  1 = confirmed / known planet
-  0 = false positive
+Two-phase workflow
+──────────────────
+  Phase 1 — Download & cache processed light curves (network-heavy, slow):
+
+    python train_classifier.py download --csv labeled_tess_dataset.csv
+    python train_classifier.py download --csv labeled_tess_dataset.csv --max-targets 200
+
+    Outputs a cache directory (default: lc_cache/) containing:
+      <TIC_ID>.npy   — 262-element float32 vector per target
+      cache_labels.csv — TIC_ID, label, mission columns
+
+  Phase 2 — Train from cache (fast, no network needed):
+
+    python train_classifier.py train
+    python train_classifier.py train --cache lc_cache --epochs 80 --batch-size 64
+    python train_classifier.py train --pretrain-cache kepler_cache --cache lc_cache
+
+    You can retrain as many times as you want without re-downloading.
+
+Architecture
+────────────
+  Input : 201-bin global view + 61-bin local view  →  262-point vector
+  Layers: Conv1d blocks → MaxPool → Flatten → FC → Dropout → Sigmoid
+  Output: planet probability
+
+Requirements
+────────────
+  pip install lightkurve pandas numpy torch scikit-learn requests astroquery
 """
 
 import argparse
 import ast
+import json
 import time
 import warnings
 from pathlib import Path
 
-import joblib
 import numpy as np
 import pandas as pd
-from astropy.timeseries import BoxLeastSquares
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.impute import SimpleImputer
+import torch
+import torch.nn as nn
 from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.model_selection import StratifiedKFold, cross_val_score, train_test_split
-from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, TensorDataset
 
 warnings.filterwarnings("ignore")
 
-RANDOM_SEED = 42
-MODEL_PATH  = "exoplanet_rf_classifier.joblib"
-
-# Coarse BLS grid for training — fast but good enough for feature extraction.
-# test.py uses a finer grid for accurate single-target inference.
+RANDOM_SEED   = 42
+MODEL_PATH    = "exoplanet_cnn.pt"
+META_PATH     = "exoplanet_cnn_meta.json"
+GLOBAL_BINS   = 201
+LOCAL_BINS    = 61
+INPUT_SIZE    = GLOBAL_BINS + LOCAL_BINS   # 262
 BLS_PERIODS   = np.linspace(0.5, 25, 500)
 BLS_DURATIONS = np.linspace(0.01, 0.3, 10)
+MAX_SECTORS   = 3
+DEFAULT_CACHE = "lc_cache"
 
-# Max sectors to average BLS over per target (cap to avoid very long runs)
-MAX_SECTORS_PER_TARGET = 3
+torch.manual_seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
 
-
-# ── Feature extraction ────────────────────────────────────────────────────────
-
-FLATTEN_WINDOW = 401  # Must match test.py
-
-
-def compute_extra_features(lc_time, lc_flux, period, t0, duration):
-    half_dur = duration / 2.0
-
-    # ── Even / odd depth ──────────────────────────────────────────────────────
-    phase       = ((lc_time - t0) % period) / period   # 0..1
-    in_transit  = (phase < half_dur / period) | (phase > 1 - half_dur / period)
-    transit_num = np.floor((lc_time - t0) / period).astype(int)
-
-    even_depths, odd_depths = [], []
-    for tn in np.unique(transit_num[in_transit]):
-        mask  = in_transit & (transit_num == tn)
-        if mask.sum() < 3:
-            continue
-        depth = 1.0 - float(np.median(lc_flux[mask]))
-        (even_depths if tn % 2 == 0 else odd_depths).append(depth)
-
-    if even_depths and odd_depths:
-        even_odd_diff = abs(np.mean(even_depths) - np.mean(odd_depths))
-    else:
-        even_odd_diff = 0.0
-
-    # ── Secondary eclipse power ───────────────────────────────────────────────
-    t0_secondary = t0 + period / 2.0
-    try:
-        bls_sec   = BoxLeastSquares(lc_time, lc_flux)
-        power_sec = bls_sec.power([period], [duration])
-        sec_power = float(power_sec.power[0] / (np.median(power_sec.power) + 1e-9))
-    except Exception:
-        sec_power = 0.0
-
-    return float(even_odd_diff), float(sec_power)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def run_bls_single_sector(tic_id: str, sector: int) -> dict | None:
+# ── Light curve processing ─────────────────────────────────────────────────────
+
+def process_lightcurve(tic_id: str, sectors: list, mission: str = "TESS") -> np.ndarray | None:
+    """
+    Download up to MAX_SECTORS light curves, concatenate, run BLS, fold and bin
+    into a (262,) numpy array. Returns None on failure.
+    """
     try:
         import lightkurve as lk
+        from astropy.timeseries import BoxLeastSquares
 
-        results = lk.search_lightcurve(
-            f"TIC {tic_id}", mission="TESS", author="SPOC", sector=sector
-        )
-        if results is None or len(results) == 0:
+        all_times, all_fluxes = [], []
+
+        for sector in sectors[:MAX_SECTORS]:
+            try:
+                if mission == "Kepler":
+                    if sector == 1:
+                        res = lk.search_lightcurve(f"KIC {tic_id}", mission="Kepler")
+                    else:
+                        continue
+                else:
+                    res = lk.search_lightcurve(
+                        f"TIC {tic_id}", mission="TESS", author="SPOC", sector=sector
+                    )
+                if res is None or len(res) == 0:
+                    continue
+                lc = res[0].download(quality_bitmask="default")
+                if lc is None:
+                    continue
+                lc = lc.remove_nans().remove_outliers(sigma=5).flatten(window_length=401).normalize()
+                all_times.append(lc.time.value)
+                all_fluxes.append(lc.flux.value)
+                time.sleep(0.05)
+            except Exception:
+                continue
+
+        if not all_times:
             return None
 
-        lc = results[0].download(quality_bitmask="default")
-        if lc is None:
-            return None
+        times  = np.concatenate(all_times)
+        fluxes = np.concatenate(all_fluxes)
 
-        lc = lc.remove_nans().remove_outliers(sigma=5).flatten(window_length=FLATTEN_WINDOW).normalize()
+        bls   = BoxLeastSquares(times, fluxes)
+        power = bls.power(BLS_PERIODS, BLS_DURATIONS)
 
-        bls = lc.to_periodogram(method="bls", period=BLS_PERIODS, duration=BLS_DURATIONS)
+        best_idx      = np.argmax(power.power)
+        best_period   = float(power.period[best_idx])
+        best_t0       = float(power.transit_time[best_idx])
+        best_duration = float(power.duration[best_idx])
 
-        best_period   = float(bls.period_at_max_power.value)
-        best_duration = float(bls.duration_at_max_power.value)
-        best_depth    = float(bls.depth_at_max_power.value)
-        best_t0       = float(bls.transit_time_at_max_power.value)
-        snr           = float(bls.snr.max())
+        phase = ((times - best_t0) / best_period) % 1.0
+        phase[phase > 0.5] -= 1.0
+        sort_idx = np.argsort(phase)
+        phase    = phase[sort_idx]
+        fluxes   = fluxes[sort_idx]
 
-        # Count transits: how many full periods fit in the timespan
-        timespan      = float(lc.time.value[-1] - lc.time.value[0])
-        transit_count = max(1, int(timespan / best_period))
+        global_bins = np.linspace(-0.5, 0.5, GLOBAL_BINS + 1)
+        global_view = _bin_lc(phase, fluxes, global_bins)
 
-        even_odd_diff, sec_power = compute_extra_features(
-            lc.time.value, lc.flux.value,
-            best_period, best_t0, best_duration
-        )
+        half_width = max(best_duration * 2.0, 0.02)
+        local_bins = np.linspace(-half_width, half_width, LOCAL_BINS + 1)
+        local_view = _bin_lc(phase, fluxes, local_bins)
 
-        return {
-            "bls_period":         best_period,
-            "bls_duration":       best_duration,
-            "bls_depth":          best_depth,
-            "bls_snr":            snr,
-            "transit_count":      transit_count,
-            "even_odd_depth_diff": even_odd_diff,
-            "secondary_eclipse_power": sec_power,
-        }
+        global_view = _normalise(global_view)
+        local_view  = _normalise(local_view)
+
+        return np.concatenate([global_view, local_view]).astype(np.float32)
+
     except Exception:
         return None
 
 
-def run_bls_all_sectors(tic_id: str, sectors: list) -> dict | None:
+def _bin_lc(phase, flux, bins):
+    n = len(bins) - 1
+    out = np.ones(n, dtype=np.float32)
+    for i in range(n):
+        mask = (phase >= bins[i]) & (phase < bins[i + 1])
+        if mask.sum() > 0:
+            out[i] = float(np.median(flux[mask]))
+    return out
+
+
+def _normalise(v):
+    med, std = np.median(v), np.std(v)
+    if std < 1e-8:
+        return np.zeros_like(v)
+    return (v - med) / std
+
+
+# ── Phase 1: Download & cache ──────────────────────────────────────────────────
+
+def cmd_download(args):
     """
-    Run BLS across all available sectors (up to MAX_SECTORS_PER_TARGET)
-    and return averaged features. A stable period across sectors is a
-    strong indicator of a real transit signal.
+    Download and cache processed light curve vectors to disk.
+    Skips targets that are already cached (safe to resume after interruption).
     """
-    sectors_to_use = sectors[:MAX_SECTORS_PER_TARGET]
-    results = []
-
-    for sector in sectors_to_use:
-        r = run_bls_single_sector(tic_id, sector)
-        if r is not None:
-            results.append(r)
-        time.sleep(0.05)
-
-    if not results:
-        return None
-
-    avg = {
-        "bls_period":              float(np.mean([r["bls_period"]              for r in results])),
-        "bls_duration":            float(np.mean([r["bls_duration"]            for r in results])),
-        "bls_depth":               float(np.mean([r["bls_depth"]               for r in results])),
-        "bls_snr":                 float(np.mean([r["bls_snr"]                 for r in results])),
-        # Std of period across sectors — real planets are consistent, FPs vary
-        "bls_period_std":          float(np.std( [r["bls_period"]              for r in results])) if len(results) > 1 else 0.0,
-        "transit_count":           float(np.mean([r["transit_count"]           for r in results])),
-        "even_odd_depth_diff":     float(np.mean([r["even_odd_depth_diff"]     for r in results])),
-        "secondary_eclipse_power": float(np.mean([r["secondary_eclipse_power"] for r in results])),
-    }
-    return avg
-
-
-def extract_features_for_row(row: pd.Series, use_bls: bool) -> dict:
-    """
-    Build a feature dict for one TIC target.
-    Averages BLS over all available sectors. Falls back to TOI values on failure.
-    """
-    tic_id  = str(row["TIC_ID"])
-    sectors = ast.literal_eval(str(row["sectors"])) if "sectors" in row and pd.notna(row.get("sectors")) else []
-
-    toi_period   = float(row["period"])            if "period"      in row and pd.notna(row.get("period"))      else np.nan
-    toi_depth    = float(row["depth_ppm"]) / 1e6   if "depth_ppm"   in row and pd.notna(row.get("depth_ppm"))   else np.nan
-    toi_duration = float(row["duration_hr"]) / 24  if "duration_hr" in row and pd.notna(row.get("duration_hr")) else np.nan
-
-    feat = {
-        "bls_period":              np.nan,
-        "bls_duration":            np.nan,
-        "bls_depth":               np.nan,
-        "bls_snr":                 np.nan,
-        "bls_period_std":          np.nan,
-        "depth_over_duration":     np.nan,
-        "transit_count":           np.nan,
-        "even_odd_depth_diff":     np.nan,
-        "secondary_eclipse_power": np.nan,
-        "toi_period":              toi_period,
-        "toi_depth":               toi_depth,
-        "toi_duration":            toi_duration,
-    }
-
-    if use_bls and sectors:
-        bls = run_bls_all_sectors(tic_id, sectors)
-        if bls:
-            feat.update({
-                "bls_period":              bls["bls_period"],
-                "bls_duration":            bls["bls_duration"],
-                "bls_depth":               bls["bls_depth"],
-                "bls_snr":                 bls["bls_snr"],
-                "bls_period_std":          bls["bls_period_std"],
-                "depth_over_duration":     bls["bls_depth"] / (bls["bls_duration"] + 1e-6),
-                "transit_count":           bls["transit_count"],
-                "even_odd_depth_diff":     bls["even_odd_depth_diff"],
-                "secondary_eclipse_power": bls["secondary_eclipse_power"],
-            })
-
-    return feat
-
-
-def build_feature_matrix(df: pd.DataFrame, use_bls: bool):
-    feature_rows = []
-    labels       = []
-    total        = len(df)
-    bls_ok_count = 0
-
-    print(f"\nExtracting features for {total:,} targets (BLS={'ON' if use_bls else 'OFF'})...")
-    if use_bls:
-        print(f"  Averaging BLS over up to {MAX_SECTORS_PER_TARGET} sectors per target.\n")
-
-    for i, (_, row) in enumerate(df.iterrows(), 1):
-        if i % 25 == 0 or i == 1:
-            print(f"  {i}/{total}  (BLS successes: {bls_ok_count})")
-
-        feat = extract_features_for_row(row, use_bls)
-
-        if use_bls and not np.isnan(feat["bls_period"]):
-            bls_ok_count += 1
-
-        feature_rows.append(feat)
-        labels.append(int(row["label"]))
-
-        if use_bls:
-            time.sleep(0.05)
-
-    if use_bls:
-        print(f"\n  BLS succeeded on {bls_ok_count}/{total} targets "
-              f"({100*bls_ok_count/total:.1f}%). TOI fallback used for the rest.")
-
-    feature_names = [
-        "bls_period", "bls_duration", "bls_depth", "bls_snr", "bls_period_std",
-        "depth_over_duration",
-        "transit_count", "even_odd_depth_diff", "secondary_eclipse_power",
-        "toi_period", "toi_depth", "toi_duration",
-    ]
-
-    X = np.array([[row[f] for f in feature_names] for row in feature_rows])
-    y = np.array(labels)
-    return X, y, feature_names
-
-
-# ── Build and compare models ──────────────────────────────────────────────────
-
-def build_models():
-    rf = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("clf", RandomForestClassifier(
-            n_estimators=300,
-            max_depth=15,
-            min_samples_leaf=3,
-            class_weight="balanced",
-            random_state=RANDOM_SEED,
-            n_jobs=-1,
-        )),
-    ])
-
-    gbt = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("clf", GradientBoostingClassifier(
-            n_estimators=200,
-            max_depth=4,
-            learning_rate=0.05,
-            subsample=0.8,
-            random_state=RANDOM_SEED,
-        )),
-    ])
-
-    return {"RandomForest": rf, "GradientBoosting": gbt}
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(description="Train exoplanet classifier on real TESS data.")
-    parser.add_argument("--csv",          type=str,  default="labeled_tess_dataset.csv")
-    parser.add_argument("--max-targets",  type=int,  default=None)
-    parser.add_argument("--toi-only",     action="store_true")
-    parser.add_argument("--model-output", type=str,  default=MODEL_PATH)
-    args = parser.parse_args()
-
-    # ── Load ──────────────────────────────────────────────────────────────────
     csv_path = Path(args.csv)
     if not csv_path.exists():
-        print(f"ERROR: '{csv_path}' not found. Run fetch_tess_labeled_dataset.py first.")
+        print(f"ERROR: '{csv_path}' not found.")
         return
 
+    cache_dir = Path(args.cache)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
     df = pd.read_csv(csv_path)
+    if "mission" not in df.columns:
+        df["mission"] = "TESS"
+
     counts = df["label"].value_counts()
     print(f"Loaded {len(df):,} rows  |  Planets: {counts.get(1,0):,}  FPs: {counts.get(0,0):,}")
 
@@ -305,57 +184,326 @@ def main():
         ).reset_index(drop=True)
         print(f"Subsampled to {len(df):,} targets (stratified).")
 
-    # ── Extract features ──────────────────────────────────────────────────────
-    X, y, feature_names = build_feature_matrix(df, use_bls=not args.toi_only)
+    labels_path = cache_dir / "cache_labels.csv"
+    if labels_path.exists():
+        existing = pd.read_csv(labels_path)
+        cached_ids = set(existing["TIC_ID"].astype(str))
+        print(f"Resuming — {len(cached_ids)} targets already cached, skipping them.")
+    else:
+        existing  = pd.DataFrame(columns=["TIC_ID", "label", "mission"])
+        cached_ids = set()
+
+    total = len(df)
+    new_rows = []
+    ok = skipped = failed = 0
+
+    print(f"\nDownloading {total:,} targets → {cache_dir}/\n")
+
+    for i, (_, row) in enumerate(df.iterrows(), 1):
+        tic_id  = str(row["TIC_ID"])
+        label   = int(row["label"])
+        mission = str(row.get("mission", "TESS"))
+
+        if tic_id in cached_ids:
+            skipped += 1
+            continue
+
+        if i % 25 == 0 or i == 1:
+            print(f"  {i}/{total}  ok={ok}  skipped={skipped}  failed={failed}")
+
+        sectors = []
+        if pd.notna(row.get("sectors", None)):
+            try:
+                sectors = ast.literal_eval(str(row["sectors"]))
+            except Exception:
+                pass
+
+        vec = process_lightcurve(tic_id, sectors, mission=mission)
+
+        if vec is not None:
+            np.save(cache_dir / f"{tic_id}.npy", vec)
+            new_rows.append({"TIC_ID": tic_id, "label": label, "mission": mission})
+            ok += 1
+        else:
+            failed += 1
+
+    # Append new rows to labels CSV
+    if new_rows:
+        updated = pd.concat([existing, pd.DataFrame(new_rows)], ignore_index=True)
+        updated.to_csv(labels_path, index=False)
+
+    total_cached = len(existing) + len(new_rows)
+    print(f"\nDone.  New: {ok}  Skipped: {skipped}  Failed: {failed}")
+    print(f"Cache: {cache_dir}/  ({total_cached} total targets)")
+    print(f"Labels: {labels_path}")
+
+
+# ── Load from cache ────────────────────────────────────────────────────────────
+
+def load_cache(cache_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load all cached .npy vectors and their labels into X, y arrays."""
+    labels_path = cache_dir / "cache_labels.csv"
+    if not labels_path.exists():
+        raise FileNotFoundError(f"No cache_labels.csv found in '{cache_dir}'. Run 'download' first.")
+
+    label_df = pd.read_csv(labels_path)
+    X, y = [], []
+    missing = 0
+
+    for _, row in label_df.iterrows():
+        npy_path = cache_dir / f"{row['TIC_ID']}.npy"
+        if npy_path.exists():
+            X.append(np.load(npy_path))
+            y.append(int(row["label"]))
+        else:
+            missing += 1
+
+    if missing:
+        print(f"  Warning: {missing} entries in labels CSV have no matching .npy file (skipped).")
+
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.int64)
+
+
+# ── CNN model ──────────────────────────────────────────────────────────────────
+
+class ExoplanetCNN(nn.Module):
+    def __init__(self, input_size: int = INPUT_SIZE, dropout: float = 0.5):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=5, padding=2),  nn.BatchNorm1d(16),  nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(16, 32, kernel_size=5, padding=2), nn.BatchNorm1d(32),  nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2), nn.BatchNorm1d(64),  nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(64, 128, kernel_size=5, padding=2), nn.BatchNorm1d(128), nn.ReLU(),
+            nn.AdaptiveAvgPool1d(8),
+        )
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 8, 512), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(512, 128),     nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, 1),       nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        return self.fc(self.conv(x)).squeeze(1)
+
+
+# ── Training loop ──────────────────────────────────────────────────────────────
+
+def train_model(X_train, y_train, X_val, y_val, epochs, batch_size, lr, init_model=None):
+    model = ExoplanetCNN().to(DEVICE)
+    if init_model is not None:
+        model.load_state_dict(init_model.state_dict())
+        print("  Loaded pretrained weights.")
+
+    criterion = nn.BCELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=5
+    )
+
+    train_loader = DataLoader(
+        TensorDataset(
+            torch.tensor(X_train).unsqueeze(1),
+            torch.tensor(y_train, dtype=torch.float32)
+        ),
+        batch_size=batch_size, shuffle=True
+    )
+    X_v = torch.tensor(X_val).unsqueeze(1).to(DEVICE)
+    y_v = torch.tensor(y_val, dtype=torch.float32)
+
+    best_f1, best_weights = 0.0, None
+
+    print(f"Training  |  {len(X_train)} train  {len(X_val)} val  "
+          f"|  epochs={epochs}  batch={batch_size}  lr={lr}\n")
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            optimizer.zero_grad()
+            loss = criterion(model(xb), yb)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * len(xb)
+
+        model.eval()
+        with torch.no_grad():
+            preds = (model(X_v).cpu().numpy() >= 0.5).astype(int)
+
+        tp = int(((preds == 1) & (y_v.numpy() == 1)).sum())
+        fp = int(((preds == 1) & (y_v.numpy() == 0)).sum())
+        fn = int(((preds == 0) & (y_v.numpy() == 1)).sum())
+        prec = tp / max(tp + fp, 1)
+        rec  = tp / max(tp + fn, 1)
+        f1   = 2 * prec * rec / max(prec + rec, 1e-8)
+
+        scheduler.step(f1)
+
+        if f1 > best_f1:
+            best_f1      = f1
+            best_weights = {k: v.clone() for k, v in model.state_dict().items()}
+
+        if epoch % 5 == 0 or epoch == 1:
+            print(f"  Epoch {epoch:>3}/{epochs}  "
+                  f"loss={total_loss/len(X_train):.4f}  "
+                  f"prec={prec:.3f}  rec={rec:.3f}  F1={f1:.3f}"
+                  + ("  *" if f1 == best_f1 else ""))
+
+    print(f"\n  Best val F1: {best_f1:.3f}")
+    model.load_state_dict(best_weights)
+    return model
+
+
+# ── Phase 2: Train ─────────────────────────────────────────────────────────────
+
+def cmd_train(args):
+    """Train (or retrain) the CNN entirely from cached .npy files — no downloads."""
+    print(f"\nDevice: {DEVICE}")
+    if DEVICE.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    # Optional: pretrain on Kepler cache first
+    pretrained_model = None
+    if args.pretrain_cache:
+        pretrain_dir = Path(args.pretrain_cache)
+        print(f"\nLoading Kepler pretrain cache from '{pretrain_dir}'...")
+        X_k, y_k = load_cache(pretrain_dir)
+        k_counts  = np.bincount(y_k)
+        print(f"Kepler: {len(X_k):,} samples  |  Planets: {k_counts[1]:,}  FPs: {k_counts[0]:,}")
+
+        if len(X_k) >= 20:
+            X_ktr, X_ktmp, y_ktr, y_ktmp = train_test_split(
+                X_k, y_k, test_size=0.15, random_state=RANDOM_SEED, stratify=y_k
+            )
+            X_ktr, X_kval, y_ktr, y_kval = train_test_split(
+                X_ktr, y_ktr, test_size=0.15, random_state=RANDOM_SEED, stratify=y_ktr
+            )
+            print(f"\n-- Phase 1: Pretraining on Kepler ({len(X_ktr):,} samples) --")
+            pretrained_model = train_model(
+                X_ktr, y_ktr, X_kval, y_kval,
+                epochs=args.epochs, batch_size=args.batch_size, lr=args.lr
+            )
+        else:
+            print("Not enough Kepler samples — skipping pretrain.")
+
+    # Load TESS cache
+    cache_dir = Path(args.cache)
+    print(f"\nLoading TESS cache from '{cache_dir}'...")
+    X, y = load_cache(cache_dir)
+    counts = np.bincount(y)
+    print(f"Loaded {len(X):,} samples  |  Planets: {counts[1]:,}  FPs: {counts[0]:,}")
+
+    if len(X) < 20:
+        print("ERROR: Not enough cached samples to train.")
+        return
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=RANDOM_SEED, stratify=y
+        X, y, test_size=0.15, random_state=RANDOM_SEED, stratify=y
     )
-    print(f"\nTrain: {len(X_train):,}  |  Test: {len(X_test):,}")
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train, y_train, test_size=0.15, random_state=RANDOM_SEED, stratify=y_train
+    )
+    print(f"Train: {len(X_train):,}  |  Val: {len(X_val):,}  |  Test: {len(X_test):,}\n")
 
-    # ── Cross-validate both models ────────────────────────────────────────────
-    models     = build_models()
-    cv         = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
-    best_name  = None
-    best_score = -1
-    best_model = None
+    if pretrained_model is not None:
+        print("-- Phase 2: Fine-tuning on TESS (lr reduced 10x) --")
+        model = train_model(
+            X_train, y_train, X_val, y_val,
+            epochs=max(args.epochs // 2, 10),
+            batch_size=args.batch_size,
+            lr=args.lr / 10,
+            init_model=pretrained_model,
+        )
+    else:
+        model = train_model(
+            X_train, y_train, X_val, y_val,
+            epochs=args.epochs, batch_size=args.batch_size, lr=args.lr
+        )
 
-    print("\n── Cross-validation (5-fold F1) ─────────────────────")
-    for name, pipeline in models.items():
-        scores = cross_val_score(pipeline, X_train, y_train, cv=cv, scoring="f1", n_jobs=-1)
-        mean_f1 = scores.mean()
-        print(f"  {name:<20} {scores.round(3)}  mean={mean_f1:.3f} ± {scores.std():.3f}")
-        if mean_f1 > best_score:
-            best_score = mean_f1
-            best_name  = name
-            best_model = pipeline
-
-    print(f"\n  Best model: {best_name} (F1={best_score:.3f})")
-
-    # ── Final evaluation on held-out test set ─────────────────────────────────
-    best_model.fit(X_train, y_train)
-    y_pred = best_model.predict(X_test)
+    # Evaluate on held-out test set
+    model.eval()
+    with torch.no_grad():
+        probs = model(torch.tensor(X_test).unsqueeze(1).to(DEVICE)).cpu().numpy()
+        preds = (probs >= 0.5).astype(int)
 
     print("\n── Classification Report ────────────────────────────")
-    print(classification_report(y_test, y_pred, target_names=["False Positive", "Planet Candidate"]))
+    print(classification_report(y_test, preds, target_names=["False Positive", "Planet Candidate"]))
 
     print("── Confusion Matrix ─────────────────────────────────")
-    cm = confusion_matrix(y_test, y_pred)
+    cm = confusion_matrix(y_test, preds)
     print(f"                 Predicted FP  Predicted Planet")
     print(f"  Actual FP          {cm[0,0]:>5}          {cm[0,1]:>5}")
     print(f"  Actual Planet      {cm[1,0]:>5}          {cm[1,1]:>5}")
 
-    print("\n── Feature Importances ──────────────────────────────")
-    importances = best_model.named_steps["clf"].feature_importances_
-    for name, imp in sorted(zip(feature_names, importances), key=lambda x: -x[1]):
-        bar = "█" * int(imp * 40)
-        print(f"  {name:<22} {imp:.4f}  {bar}")
+    # Save model + metadata
+    torch.save(model.state_dict(), args.model_output)
+    meta = {
+        "input_size":    INPUT_SIZE,
+        "global_bins":   GLOBAL_BINS,
+        "local_bins":    LOCAL_BINS,
+        "bls_periods":   [float(BLS_PERIODS[0]),   float(BLS_PERIODS[-1]),   len(BLS_PERIODS)],
+        "bls_durations": [float(BLS_DURATIONS[0]), float(BLS_DURATIONS[-1]), len(BLS_DURATIONS)],
+        "max_sectors":   MAX_SECTORS,
+    }
+    with open(META_PATH, "w") as f:
+        json.dump(meta, f, indent=2)
 
-    # ── Save ──────────────────────────────────────────────────────────────────
-    joblib.dump(best_model, args.model_output)
-    print(f"\nSaved {best_name} model to '{args.model_output}'")
-    print(f"\nFeature order for inference:")
-    print(f"  {feature_names}")
+    print(f"\nModel    : {args.model_output}")
+    print(f"Metadata : {META_PATH}")
+    print(f"Device   : {DEVICE}")
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Exoplanet CNN — two-phase workflow: download then train.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Download & cache light curves
+  python train_classifier.py download --csv labeled_tess_dataset.csv
+  python train_classifier.py download --csv labeled_tess_dataset.csv --max-targets 200
+
+  # Train from cache (repeatable, no network needed)
+  python train_classifier.py train
+  python train_classifier.py train --epochs 80 --batch-size 64
+
+  # Pretrain on Kepler cache, fine-tune on TESS cache
+  python train_classifier.py download --csv labeled_kepler_dataset.csv --cache kepler_cache
+  python train_classifier.py train --pretrain-cache kepler_cache --cache lc_cache
+"""
+    )
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # ── download subcommand ──
+    dl = sub.add_parser("download", help="Fetch & cache processed light curves to disk.")
+    dl.add_argument("--csv",         type=str, default="labeled_tess_dataset.csv",
+                    help="Labeled dataset CSV (default: labeled_tess_dataset.csv)")
+    dl.add_argument("--cache",       type=str, default=DEFAULT_CACHE,
+                    help=f"Cache directory (default: {DEFAULT_CACHE})")
+    dl.add_argument("--max-targets", type=int, default=None,
+                    help="Limit number of targets (stratified, for quick tests)")
+
+    # ── train subcommand ──
+    tr = sub.add_parser("train", help="Train CNN from cached light curves (no network needed).")
+    tr.add_argument("--cache",          type=str,   default=DEFAULT_CACHE,
+                    help=f"TESS cache directory (default: {DEFAULT_CACHE})")
+    tr.add_argument("--pretrain-cache", type=str,   default=None,
+                    help="Kepler cache directory for pretraining (optional)")
+    tr.add_argument("--epochs",         type=int,   default=50)
+    tr.add_argument("--batch-size",     type=int,   default=32)
+    tr.add_argument("--lr",             type=float, default=1e-3)
+    tr.add_argument("--model-output",   type=str,   default=MODEL_PATH)
+
+    args = parser.parse_args()
+
+    if args.command == "download":
+        cmd_download(args)
+    elif args.command == "train":
+        cmd_train(args)
 
 
 if __name__ == "__main__":
