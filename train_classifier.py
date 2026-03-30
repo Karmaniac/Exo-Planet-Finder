@@ -88,9 +88,14 @@ def process_lightcurve(tic_id: str, sectors: list, mission: str = "TESS") -> np.
                     else:
                         continue
                 else:
+                    # Try SPOC first, fall back to QLP (used by Astronet/MIT)
                     res = lk.search_lightcurve(
                         f"TIC {tic_id}", mission="TESS", author="SPOC", sector=sector
                     )
+                    if res is None or len(res) == 0:
+                        res = lk.search_lightcurve(
+                            f"TIC {tic_id}", mission="TESS", author="QLP", sector=sector
+                        )
                 if res is None or len(res) == 0:
                     continue
                 lc = res[0].download(quality_bitmask="default")
@@ -336,7 +341,7 @@ class ExoplanetCNN(nn.Module):
         self.fc = nn.Sequential(
         nn.Linear(128 * 8 + 16, 256), nn.ReLU(), nn.Dropout(dropout),
         nn.Linear(256, 64),            nn.ReLU(), nn.Dropout(dropout),
-        nn.Linear(64, 1),              nn.Sigmoid(),
+        nn.Linear(64, 1),  # no Sigmoid — BCEWithLogitsLoss handles it
 )
 
     def forward(self, x, s):
@@ -344,7 +349,7 @@ class ExoplanetCNN(nn.Module):
         scalar_out = self.scalar_branch(s)
         merged     = torch.cat([conv_out, scalar_out], dim=1)
         out = self.fc(merged).squeeze(1)
-        return out.clamp(1e-7, 1 - 1e-7)  # guard against NaN blowing BCELoss
+        return torch.sigmoid(out).clamp(1e-7, 1 - 1e-7)
 
 
 # ── Training loop ──────────────────────────────────────────────────────────────
@@ -355,7 +360,12 @@ def train_model(X_train, y_train, X_val, y_val, S_train, S_val, epochs, batch_si
         model.load_state_dict(init_model.state_dict())
         print("  Loaded pretrained weights.")
 
-    criterion = nn.BCELoss()
+    n_neg = int((y_train == 0).sum())
+    n_pos = int((y_train == 1).sum())
+    pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32).to(DEVICE)
+    print(f"  Class weights: pos_weight={pos_weight.item():.3f}  "
+          f"(neg={n_neg} pos={n_pos})")
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", factor=0.5, patience=5
