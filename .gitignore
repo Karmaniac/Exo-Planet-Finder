@@ -10,3 +10,9 @@ venv/
 
 # OS
 .DS_Store
+
+# files
+lc_cache_old/
+kepler_cache_old/
+lc_cache/
+kepler+cahce/

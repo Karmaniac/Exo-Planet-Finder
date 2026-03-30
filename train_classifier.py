@@ -55,7 +55,7 @@ MODEL_PATH    = "exoplanet_cnn.pt"
 META_PATH     = "exoplanet_cnn_meta.json"
 GLOBAL_BINS   = 201
 LOCAL_BINS    = 61
-INPUT_SIZE    = GLOBAL_BINS + LOCAL_BINS   # 262
+INPUT_SIZE    = GLOBAL_BINS + LOCAL_BINS + 2   # 264 (+ secondary eclipse depth, even/odd diff)
 BLS_PERIODS   = np.linspace(0.5, 25, 500)
 BLS_DURATIONS = np.linspace(0.01, 0.3, 10)
 MAX_SECTORS   = 3
@@ -133,7 +133,32 @@ def process_lightcurve(tic_id: str, sectors: list, mission: str = "TESS") -> np.
         global_view = _normalise(global_view)
         local_view  = _normalise(local_view)
 
-        return np.concatenate([global_view, local_view]).astype(np.float32)
+        # ── Extra features ────────────────────────────────────────────────────
+        # 1. Secondary eclipse depth at phase 0.5 (eclipsing binaries show a dip here)
+        sec_half = max(best_duration * 2.0, 0.02)
+        sec_mask = (phase >= 0.5 - sec_half) & (phase <= 0.5 + sec_half)
+        if sec_mask.sum() > 0:
+            sec_depth = float(1.0 - np.median(fluxes[sec_mask]))
+        else:
+            sec_depth = 0.0
+
+        # 2. Even/odd transit depth difference (eclipsing binaries alternate depth)
+        transit_mask = (phase >= -half_width) & (phase <= half_width)
+        t_times  = times[sort_idx][transit_mask]
+        t_fluxes = fluxes[transit_mask]
+        if len(t_times) > 4:
+            transit_nums = np.floor((t_times - best_t0) / best_period).astype(int)
+            even_flux = t_fluxes[transit_nums % 2 == 0]
+            odd_flux  = t_fluxes[transit_nums % 2 == 1]
+            even_depth = float(1.0 - np.median(even_flux)) if len(even_flux) > 0 else 0.0
+            odd_depth  = float(1.0 - np.median(odd_flux))  if len(odd_flux)  > 0 else 0.0
+            even_odd_diff = abs(even_depth - odd_depth)
+        else:
+            even_odd_diff = 0.0
+
+        extra = np.array([sec_depth, even_odd_diff], dtype=np.float32)
+
+        return np.concatenate([global_view, local_view, extra]).astype(np.float32)
 
     except Exception:
         return None
@@ -240,34 +265,62 @@ def cmd_download(args):
 
 # ── Load from cache ────────────────────────────────────────────────────────────
 
-def load_cache(cache_dir: Path) -> tuple[np.ndarray, np.ndarray]:
-    """Load all cached .npy vectors and their labels into X, y arrays."""
+def load_cache(cache_dir: Path, scalar_csv: str | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load cached .npy vectors, labels, and optional normalized scalar features."""
     labels_path = cache_dir / "cache_labels.csv"
     if not labels_path.exists():
         raise FileNotFoundError(f"No cache_labels.csv found in '{cache_dir}'. Run 'download' first.")
 
     label_df = pd.read_csv(labels_path)
-    X, y = [], []
+    label_df["TIC_ID"] = label_df["TIC_ID"].astype(str)
+
+    scalar_map = {}
+    if scalar_csv and Path(scalar_csv).exists():
+        sdf = pd.read_csv(scalar_csv)
+        sdf["TIC_ID"] = sdf["TIC_ID"].astype(str)
+        for _, row in sdf.iterrows():
+            period   = float(row.get("period",      0.0) or 0.0)
+            depth    = float(row.get("depth_ppm",   0.0) or 0.0)
+            duration = float(row.get("duration_hr", 0.0) or 0.0)
+            scalar_map[str(row["TIC_ID"])] = [np.log1p(period), np.log1p(depth), duration]
+
+    X, y, S = [], [], []
     missing = 0
 
     for _, row in label_df.iterrows():
-        npy_path = cache_dir / f"{row['TIC_ID']}.npy"
+        tic_id   = str(row["TIC_ID"])
+        npy_path = cache_dir / f"{tic_id}.npy"
         if npy_path.exists():
             X.append(np.load(npy_path))
             y.append(int(row["label"]))
+            S.append(scalar_map.get(tic_id, [0.0, 0.0, 0.0]))
         else:
             missing += 1
 
     if missing:
         print(f"  Warning: {missing} entries in labels CSV have no matching .npy file (skipped).")
 
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.int64)
+    X_arr = np.array(X, dtype=np.float32)
+    y_arr = np.array(y, dtype=np.int64)
+    S_arr = np.array(S, dtype=np.float32)
+
+    # Replace NaN/inf with 0 before normalizing
+    S_arr = np.nan_to_num(S_arr, nan=0.0, posinf=0.0, neginf=0.0)
+    # Normalize scalars to zero mean, unit std
+    if S_arr.shape[0] > 0 and S_arr.std() > 1e-8:
+        s_mean = S_arr.mean(axis=0)
+        s_std  = S_arr.std(axis=0) + 1e-8
+        S_arr  = (S_arr - s_mean) / s_std
+
+    return X_arr, y_arr, S_arr
 
 
 # ── CNN model ──────────────────────────────────────────────────────────────────
 
+N_SCALARS = 3  # log(period), log(depth_ppm), duration_hr
+
 class ExoplanetCNN(nn.Module):
-    def __init__(self, input_size: int = INPUT_SIZE, dropout: float = 0.5):
+    def __init__(self, input_size: int = INPUT_SIZE, dropout: float = 0.55, n_scalars: int = N_SCALARS):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv1d(1, 16, kernel_size=5, padding=2),  nn.BatchNorm1d(16),  nn.ReLU(), nn.MaxPool1d(2),
@@ -276,20 +329,27 @@ class ExoplanetCNN(nn.Module):
             nn.Conv1d(64, 128, kernel_size=5, padding=2), nn.BatchNorm1d(128), nn.ReLU(),
             nn.AdaptiveAvgPool1d(8),
         )
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128 * 8, 512), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(512, 128),     nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(128, 1),       nn.Sigmoid(),
+        self.scalar_branch = nn.Sequential(
+            nn.Linear(n_scalars, 16), nn.ReLU(),
+            nn.Linear(16, 16),        nn.ReLU(),
         )
+        self.fc = nn.Sequential(
+        nn.Linear(128 * 8 + 16, 256), nn.ReLU(), nn.Dropout(dropout),
+        nn.Linear(256, 64),            nn.ReLU(), nn.Dropout(dropout),
+        nn.Linear(64, 1),              nn.Sigmoid(),
+)
 
-    def forward(self, x):
-        return self.fc(self.conv(x)).squeeze(1)
+    def forward(self, x, s):
+        conv_out   = self.conv(x).flatten(1)
+        scalar_out = self.scalar_branch(s)
+        merged     = torch.cat([conv_out, scalar_out], dim=1)
+        out = self.fc(merged).squeeze(1)
+        return out.clamp(1e-7, 1 - 1e-7)  # guard against NaN blowing BCELoss
 
 
 # ── Training loop ──────────────────────────────────────────────────────────────
 
-def train_model(X_train, y_train, X_val, y_val, epochs, batch_size, lr, init_model=None):
+def train_model(X_train, y_train, X_val, y_val, S_train, S_val, epochs, batch_size, lr, init_model=None, patience=15):
     model = ExoplanetCNN().to(DEVICE)
     if init_model is not None:
         model.load_state_dict(init_model.state_dict())
@@ -304,32 +364,38 @@ def train_model(X_train, y_train, X_val, y_val, epochs, batch_size, lr, init_mod
     train_loader = DataLoader(
         TensorDataset(
             torch.tensor(X_train).unsqueeze(1),
+            torch.tensor(S_train, dtype=torch.float32),
             torch.tensor(y_train, dtype=torch.float32)
         ),
         batch_size=batch_size, shuffle=True
     )
     X_v = torch.tensor(X_val).unsqueeze(1).to(DEVICE)
+    S_v = torch.tensor(S_val, dtype=torch.float32).to(DEVICE)
     y_v = torch.tensor(y_val, dtype=torch.float32)
 
     best_f1, best_weights = 0.0, None
+    epochs_no_improve = 0
 
+    # Sanity check inputs
+    assert not np.isnan(X_train).any(), "NaN in X_train"
+    assert not np.isnan(S_train).any(), "NaN in S_train"
     print(f"Training  |  {len(X_train)} train  {len(X_val)} val  "
           f"|  epochs={epochs}  batch={batch_size}  lr={lr}\n")
 
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
-        for xb, yb in train_loader:
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+        for xb, sb, yb in train_loader:
+            xb, sb, yb = xb.to(DEVICE), sb.to(DEVICE), yb.to(DEVICE)
             optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
+            loss = criterion(model(xb, sb), yb)
             loss.backward()
             optimizer.step()
             total_loss += loss.item() * len(xb)
 
         model.eval()
         with torch.no_grad():
-            preds = (model(X_v).cpu().numpy() >= 0.5).astype(int)
+            preds = (model(X_v, S_v).cpu().numpy() >= 0.5).astype(int)
 
         tp = int(((preds == 1) & (y_v.numpy() == 1)).sum())
         fp = int(((preds == 1) & (y_v.numpy() == 0)).sum())
@@ -341,14 +407,21 @@ def train_model(X_train, y_train, X_val, y_val, epochs, batch_size, lr, init_mod
         scheduler.step(f1)
 
         if f1 > best_f1:
-            best_f1      = f1
-            best_weights = {k: v.clone() for k, v in model.state_dict().items()}
+            best_f1          = f1
+            best_weights     = {k: v.clone() for k, v in model.state_dict().items()}
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
 
         if epoch % 5 == 0 or epoch == 1:
             print(f"  Epoch {epoch:>3}/{epochs}  "
                   f"loss={total_loss/len(X_train):.4f}  "
                   f"prec={prec:.3f}  rec={rec:.3f}  F1={f1:.3f}"
                   + ("  *" if f1 == best_f1 else ""))
+
+        if epochs_no_improve >= patience:
+            print(f"  Early stopping at epoch {epoch} (no improvement for {patience} epochs)")
+            break
 
     print(f"\n  Best val F1: {best_f1:.3f}")
     model.load_state_dict(best_weights)
@@ -368,21 +441,35 @@ def cmd_train(args):
     if args.pretrain_cache:
         pretrain_dir = Path(args.pretrain_cache)
         print(f"\nLoading Kepler pretrain cache from '{pretrain_dir}'...")
-        X_k, y_k = load_cache(pretrain_dir)
+        X_k, y_k, S_k = load_cache(pretrain_dir, scalar_csv=args.kepler_csv)
         k_counts  = np.bincount(y_k)
         print(f"Kepler: {len(X_k):,} samples  |  Planets: {k_counts[1]:,}  FPs: {k_counts[0]:,}")
 
         if len(X_k) >= 20:
-            X_ktr, X_ktmp, y_ktr, y_ktmp = train_test_split(
-                X_k, y_k, test_size=0.15, random_state=RANDOM_SEED, stratify=y_k
+            # Balance Kepler to 1:1 planet/FP ratio to avoid bias toward FPs
+            planet_idx = np.where(y_k == 1)[0]
+            fp_idx     = np.where(y_k == 0)[0]
+            n_each     = min(len(planet_idx), len(fp_idx))
+            rng        = np.random.default_rng(RANDOM_SEED)
+            balanced_idx = np.concatenate([
+                rng.choice(planet_idx, n_each, replace=False),
+                rng.choice(fp_idx,     n_each, replace=False),
+            ])
+            rng.shuffle(balanced_idx)
+            X_k, y_k, S_k = X_k[balanced_idx], y_k[balanced_idx], S_k[balanced_idx]
+            print(f"Kepler balanced: {n_each} planets + {n_each} FPs = {len(X_k):,} total")
+
+            X_ktr, X_ktmp, y_ktr, y_ktmp, S_ktr, S_ktmp = train_test_split(
+                X_k, y_k, S_k, test_size=0.15, random_state=RANDOM_SEED, stratify=y_k
             )
-            X_ktr, X_kval, y_ktr, y_kval = train_test_split(
-                X_ktr, y_ktr, test_size=0.15, random_state=RANDOM_SEED, stratify=y_ktr
+            X_ktr, X_kval, y_ktr, y_kval, S_ktr, S_kval = train_test_split(
+                X_ktr, y_ktr, S_ktr, test_size=0.15, random_state=RANDOM_SEED, stratify=y_ktr
             )
             print(f"\n-- Phase 1: Pretraining on Kepler ({len(X_ktr):,} samples) --")
             pretrained_model = train_model(
-                X_ktr, y_ktr, X_kval, y_kval,
-                epochs=args.epochs, batch_size=args.batch_size, lr=args.lr
+                X_ktr, y_ktr, X_kval, y_kval, S_ktr, S_kval,
+                epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
+                patience=args.patience
             )
         else:
             print("Not enough Kepler samples — skipping pretrain.")
@@ -390,7 +477,7 @@ def cmd_train(args):
     # Load TESS cache
     cache_dir = Path(args.cache)
     print(f"\nLoading TESS cache from '{cache_dir}'...")
-    X, y = load_cache(cache_dir)
+    X, y, S = load_cache(cache_dir, scalar_csv=args.tess_csv)
     counts = np.bincount(y)
     print(f"Loaded {len(X):,} samples  |  Planets: {counts[1]:,}  FPs: {counts[0]:,}")
 
@@ -398,33 +485,38 @@ def cmd_train(args):
         print("ERROR: Not enough cached samples to train.")
         return
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.15, random_state=RANDOM_SEED, stratify=y
+    X_train, X_test, y_train, y_test, S_train, S_test = train_test_split(
+        X, y, S, test_size=0.15, random_state=RANDOM_SEED, stratify=y
     )
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train, y_train, test_size=0.15, random_state=RANDOM_SEED, stratify=y_train
+    X_train, X_val, y_train, y_val, S_train, S_val = train_test_split(
+        X_train, y_train, S_train, test_size=0.15, random_state=RANDOM_SEED, stratify=y_train
     )
     print(f"Train: {len(X_train):,}  |  Val: {len(X_val):,}  |  Test: {len(X_test):,}\n")
 
     if pretrained_model is not None:
         print("-- Phase 2: Fine-tuning on TESS (lr reduced 10x) --")
         model = train_model(
-            X_train, y_train, X_val, y_val,
-            epochs=max(args.epochs // 2, 10),
+            X_train, y_train, X_val, y_val, S_train, S_val,
+            epochs=max(args.epochs, 50),
             batch_size=args.batch_size,
             lr=args.lr / 10,
             init_model=pretrained_model,
+            patience=args.patience,
         )
     else:
         model = train_model(
-            X_train, y_train, X_val, y_val,
-            epochs=args.epochs, batch_size=args.batch_size, lr=args.lr
+            X_train, y_train, X_val, y_val, S_train, S_val,
+            epochs=args.epochs, batch_size=args.batch_size, lr=args.lr,
+            patience=args.patience,
         )
 
     # Evaluate on held-out test set
     model.eval()
     with torch.no_grad():
-        probs = model(torch.tensor(X_test).unsqueeze(1).to(DEVICE)).cpu().numpy()
+        probs = model(
+            torch.tensor(X_test).unsqueeze(1).to(DEVICE),
+            torch.tensor(S_test, dtype=torch.float32).to(DEVICE)
+        ).cpu().numpy()
         preds = (probs >= 0.5).astype(int)
 
     print("\n── Classification Report ────────────────────────────")
@@ -496,6 +588,12 @@ Examples:
     tr.add_argument("--epochs",         type=int,   default=50)
     tr.add_argument("--batch-size",     type=int,   default=32)
     tr.add_argument("--lr",             type=float, default=1e-3)
+    tr.add_argument("--tess-csv",        type=str,   default="labeled_tess_dataset.csv",
+                    help="TESS labeled CSV for scalar features")
+    tr.add_argument("--kepler-csv",      type=str,   default="labeled_kepler_dataset.csv",
+                    help="Kepler labeled CSV for scalar features")
+    tr.add_argument("--patience",        type=int,   default=15,
+                    help="Early stopping patience in epochs (default: 15)")
     tr.add_argument("--model-output",   type=str,   default=MODEL_PATH)
 
     args = parser.parse_args()

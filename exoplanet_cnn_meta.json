@@ -1,0 +1,16 @@
+{
+  "input_size": 264,
+  "global_bins": 201,
+  "local_bins": 61,
+  "bls_periods": [
+    0.5,
+    25.0,
+    500
+  ],
+  "bls_durations": [
+    0.01,
+    0.3,
+    10
+  ],
+  "max_sectors": 3
+}
