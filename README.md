@@ -29,7 +29,7 @@ pip install -r requirements.txt
 
 ---
 
-## Usage
+## Usage (Skip to #5 to use the pretrained model with specs given above)
 
 ### Step 1 — Fetch labeled dataset
 ```bash
