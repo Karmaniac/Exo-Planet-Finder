@@ -1,25 +1,3 @@
-"""
-fetch_kepler_dataset.py
------------------------
-Downloads the NASA Exoplanet Archive Kepler KOI cumulative table,
-filters to confirmed planets (CONFIRMED) and false positives (FALSE POSITIVE),
-and fetches available Kepler quarters for each KIC ID.
-
-Output: labeled_kepler_dataset.csv
-Columns: KIC_ID, label (1=planet, 0=false positive), quarters, period, depth_ppm, duration_hr
-
-Requirements:
-    pip install lightkurve pandas requests
-
-Usage:
-    python fetch_kepler_dataset.py
-
-    Optional flags:
-        --max-targets 500        # limit how many targets to query (default: all)
-        --output my_kepler.csv   # custom output filename
-        --no-balance             # keep full imbalanced dataset
-"""
-
 import argparse
 import sys
 import time

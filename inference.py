@@ -1,14 +1,3 @@
-"""
-inference.py
-────────────
-Run the trained CNN exoplanet classifier on a new TESS target.
-
-Usage:
-  python inference.py 231663901
-  python inference.py 231663901 --model exoplanet_cnn.pt
-  python inference.py 231663901 --period 4.41 --depth 15062 --duration 3.65
-"""
-
 import argparse
 import time
 import warnings
@@ -51,14 +40,14 @@ class ExoplanetCNN(nn.Module):
         self.fc = nn.Sequential(
             nn.Linear(128 * 8 + 16, 256), nn.ReLU(), nn.Dropout(dropout),
             nn.Linear(256, 64),            nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(64, 1),              nn.Sigmoid(),
+            nn.Linear(64, 1),
         )
 
     def forward(self, x, s):
         conv_out   = self.conv(x).flatten(1)
         scalar_out = self.scalar_branch(s)
         merged     = torch.cat([conv_out, scalar_out], dim=1)
-        return self.fc(merged).squeeze(1).clamp(1e-7, 1 - 1e-7)
+        return torch.sigmoid(self.fc(merged).squeeze(1)).clamp(1e-7, 1 - 1e-7)
 
 
 # ── Light curve processing (identical to train_classifier.py) ─────────────────
@@ -183,13 +172,14 @@ def process_tic(tic_id: str) -> tuple[np.ndarray | None, dict]:
 
 # These are approximate log-scale means/stds derived from the TESS training set.
 # If you have the labeled_tess_dataset.csv handy, pass --csv to compute exactly.
-SCALAR_MEAN = np.array([1.5, 8.5, 2.8], dtype=np.float32)  # log1p(period), log1p(depth_ppm), duration_hr
+# Approximate fallback stats — pass --csv for exact normalization
+SCALAR_MEAN = np.array([1.5, 8.5, 2.8], dtype=np.float32)
 SCALAR_STD  = np.array([1.2, 2.1, 1.6], dtype=np.float32)
 
 
 def normalize_scalars(period: float, depth_ppm: float, duration_hr: float,
                       csv_path: str | None = None) -> np.ndarray:
-    """Normalize scalars the same way load_cache does during training."""
+    """Normalize scalars exactly as load_cache does during training."""
     raw = np.array([np.log1p(period), np.log1p(depth_ppm), duration_hr], dtype=np.float32)
 
     if csv_path and Path(csv_path).exists():
@@ -199,13 +189,15 @@ def normalize_scalars(period: float, depth_ppm: float, duration_hr: float,
         depths    = np.log1p(df["depth_ppm"].fillna(0).values.astype(float))
         durations = df["duration_hr"].fillna(0).values.astype(float)
         all_s = np.stack([periods, depths, durations], axis=1).astype(np.float32)
+        # Match load_cache: nan_to_num then normalize
+        all_s = np.nan_to_num(all_s, nan=0.0, posinf=0.0, neginf=0.0)
         mean  = all_s.mean(axis=0)
         std   = all_s.std(axis=0) + 1e-8
     else:
         mean = SCALAR_MEAN
         std  = SCALAR_STD
 
-    return (raw - mean) / std
+    return np.nan_to_num((raw - mean) / std, nan=0.0)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -223,6 +215,10 @@ def main():
                         help="Override transit depth (ppm)")
     parser.add_argument("--duration",      type=float, default=None,
                         help="Override transit duration (hours)")
+    parser.add_argument("--cache",         type=str,   default="lc_cache",
+                        help="Cache directory to check before downloading (default: lc_cache)")
+    parser.add_argument("--force-download", action="store_true",
+                        help="Force fresh download even if cached")
     args = parser.parse_args()
 
     print(f"\nDevice: {DEVICE}")
@@ -238,22 +234,49 @@ def main():
     model.eval()
     print(f"Loaded model: {model_path}\n")
 
-    # Process light curve
-    print(f"Processing TIC {args.tic_id}...")
-    vec, bls_info = process_tic(args.tic_id)
+    import pandas as pd
+    # Check if target is already cached — use cached vector for consistency with training
+    cache_dir = Path(args.cache)
+    npy_path  = cache_dir / f"{args.tic_id}.npy"
+    bls_info  = {}
 
-    if vec is None:
-        print("Could not process light curve. Exiting.")
-        return
+    if npy_path.exists() and not args.force_download:
+        print(f"Found cached vector for TIC {args.tic_id} — using cache.")
+        vec = np.load(npy_path)
 
-    # Use BLS-derived scalars unless overridden
-    period     = args.period   if args.period   is not None else bls_info["period"]
-    depth_ppm  = args.depth    if args.depth    is not None else bls_info["depth_ppm"]
-    duration_hr = args.duration if args.duration is not None else bls_info["duration_hr"]
+        # Get scalars from CSV if available
+        period, depth_ppm, duration_hr = 0.0, 0.0, 0.0
+        if args.csv and Path(args.csv).exists():
+            df = pd.read_csv(args.csv)
+            df["TIC_ID"] = df["TIC_ID"].astype(str)
+            row = df[df["TIC_ID"] == str(args.tic_id)]
+            if not row.empty:
+                period      = float(row.iloc[0].get("period",      0.0) or 0.0)
+                depth_ppm   = float(row.iloc[0].get("depth_ppm",   0.0) or 0.0)
+                duration_hr = float(row.iloc[0].get("duration_hr", 0.0) or 0.0)
+        period      = args.period    if args.period    is not None else period
+        depth_ppm   = args.depth     if args.depth     is not None else depth_ppm
+        duration_hr = args.duration  if args.duration  is not None else duration_hr
+
+        bls_info = {
+            "period": period, "duration_hr": duration_hr,
+            "depth_ppm": depth_ppm, "sec_depth": float(vec[-2]),
+            "even_odd_diff": float(vec[-1]), "sectors_used": "cached"
+        }
+    else:
+        # Download fresh
+        print(f"Processing TIC {args.tic_id}...")
+        vec, bls_info = process_tic(args.tic_id)
+        if vec is None:
+            print("Could not process light curve. Exiting.")
+            return
+        period      = args.period    if args.period    is not None else bls_info["period"]
+        depth_ppm   = args.depth     if args.depth     is not None else bls_info["depth_ppm"]
+        duration_hr = args.duration  if args.duration  is not None else bls_info["duration_hr"]
 
     scalars = normalize_scalars(period, depth_ppm, duration_hr, csv_path=args.csv)
 
-    # Run inference
+    # Run inference — full 264-vec into conv branch, 3 scalars into scalar branch
     X = torch.tensor(vec).unsqueeze(0).unsqueeze(0).to(DEVICE)   # (1, 1, 264)
     S = torch.tensor(scalars).unsqueeze(0).to(DEVICE)             # (1, 3)
 

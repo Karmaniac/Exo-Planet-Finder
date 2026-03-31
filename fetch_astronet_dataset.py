@@ -5,8 +5,8 @@ Downloads the Astronet-Triage tces.csv from GitHub and converts it into
 the labeled_tess_dataset.csv format used by train_classifier.py download.
 
 Labels:
-  PC (planet candidate) → 1
-  EB, IS, V, O, J       → 0  (all false positive / non-planet classes)
+  PC (planet candidate) = 1
+  EB, IS, V, O, J       = 0  (all false positive / non-planet classes)
 
 Output:
   astronet_tess_dataset.csv — ready to feed into train_classifier.py download

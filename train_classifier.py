@@ -8,29 +8,31 @@ Two-phase workflow
   Phase 1 — Download & cache processed light curves (network-heavy, slow):
 
     python train_classifier.py download --csv labeled_tess_dataset.csv
-    python train_classifier.py download --csv labeled_tess_dataset.csv --max-targets 200
+    python fetch_astronet_dataset.py --exclude-existing labeled_tess_dataset.csv
 
     Outputs a cache directory (default: lc_cache/) containing:
-      <TIC_ID>.npy   — 262-element float32 vector per target
+      <TIC_ID>.npy   — 264-element float32 vector per target
       cache_labels.csv — TIC_ID, label, mission columns
 
-  Phase 2 — Train from cache (fast, no network needed):
+  Phase 2 — Train from cache:
 
-    python train_classifier.py train
-    python train_classifier.py train --cache lc_cache --epochs 80 --batch-size 64
-    python train_classifier.py train --pretrain-cache kepler_cache --cache lc_cache
+    python train_classifier.py train --epochs 200 --patience 40 --batch-size 32 --tess-csv labeled_tess_dataset.csv
 
     You can retrain as many times as you want without re-downloading.
 
 Architecture
 ────────────
-  Input : 201-bin global view + 61-bin local view  →  262-point vector
-  Layers: Conv1d blocks → MaxPool → Flatten → FC → Dropout → Sigmoid
-  Output: planet probability
+  Light curve branch : 201-bin global view + 61-bin local view + secondary eclipse depth + even/odd depth diff
+                       → 264-point vector
+                       4× Conv1d blocks (BatchNorm · ReLU · MaxPool) → AdaptiveAvgPool → Flatten → 1024
 
-Requirements
-────────────
-  pip install lightkurve pandas numpy torch scikit-learn requests astroquery
+  Scalar branch      : log(period) · log(depth) · duration
+                       2× Linear layers → 16
+
+  Merge              : Concatenate 1024 + 16 = 1040
+                       Linear 1040→256 → Linear 256→64 → Linear 64→1 · Sigmoid
+
+  Output             : planet probability (0–1)
 """
 
 import argparse
