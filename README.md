@@ -66,11 +66,3 @@ python inference.py <TIC_ID> --csv labeled_tess_dataset.csv
 |---|---|
 | `1` | Confirmed planet |
 | `0` | False positive |
-
----
-
-## Notes
-
-- Light curves are downloaded from MAST via SPOC pipeline (QLP fallback). Up to 3 sectors per target.
-- The download step is resumable — interrupted runs skip already-cached targets.
-- Cache directories (`lc_cache/`, `kepler_cache/`) and model weights (`exoplanet_cnn.pt`) are gitignored.
