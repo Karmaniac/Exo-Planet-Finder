@@ -15,4 +15,4 @@ venv/
 lc_cache_old/
 kepler_cache_old/
 kepler_cache/
-stellar_cache.jsonlc_cache/
+lc_cache/
