@@ -1,4 +1,5 @@
 import argparse
+import json
 import time
 import warnings
 from pathlib import Path
@@ -18,7 +19,17 @@ BLS_DURATIONS = np.linspace(0.01, 0.3, 10)
 MAX_SECTORS   = 3
 N_SCALARS     = 3
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def _pick_device() -> torch.device:
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    try:
+        nn.Conv1d(1, 1, 3).to("cuda")(torch.zeros(1, 1, 8, device="cuda"))
+        return torch.device("cuda")
+    except Exception:
+        return torch.device("cpu")   # cuda present but engine broken (driver/cuDNN mismatch)
+
+
+DEVICE = _pick_device()
 
 
 # ── CNN model (identical to train_classifier.py) ──────────────────────────────
@@ -200,6 +211,169 @@ def normalize_scalars(period: float, depth_ppm: float, duration_hr: float,
     return np.nan_to_num((raw - mean) / std, nan=0.0)
 
 
+# ── Shared prediction logic (used by CLI and the GUI) ──────────────────────────
+
+def predict_tic(tic_id: str, model: "ExoplanetCNN", csv_path: str = "labeled_tess_dataset.csv",
+                cache_dir: str = "lc_cache", force_download: bool = False,
+                period: float = None, depth: float = None, duration: float = None) -> tuple[float, dict]:
+    """Run the full feature pipeline + model for a TIC ID. Returns (probability, bls_info)."""
+    import pandas as pd
+
+    npy_path = Path(cache_dir) / f"{tic_id}.npy"
+
+    if npy_path.exists() and not force_download:
+        vec = np.load(npy_path)
+
+        p, d, dur = 0.0, 0.0, 0.0
+        if csv_path and Path(csv_path).exists():
+            df = pd.read_csv(csv_path)
+            df["TIC_ID"] = df["TIC_ID"].astype(str)
+            row = df[df["TIC_ID"] == str(tic_id)]
+            if not row.empty:
+                p   = float(row.iloc[0].get("period",      0.0) or 0.0)
+                d   = float(row.iloc[0].get("depth_ppm",   0.0) or 0.0)
+                dur = float(row.iloc[0].get("duration_hr", 0.0) or 0.0)
+
+        bls_info = {
+            "period": period if period is not None else p,
+            "depth_ppm": depth if depth is not None else d,
+            "duration_hr": duration if duration is not None else dur,
+            "sec_depth": float(vec[-2]), "even_odd_diff": float(vec[-1]),
+            "sectors_used": "cached",
+        }
+    else:
+        vec, bls_info = process_tic(tic_id)
+        if vec is None:
+            return None, {}
+        bls_info["period"]      = period if period is not None else bls_info["period"]
+        bls_info["depth_ppm"]   = depth if depth is not None else bls_info["depth_ppm"]
+        bls_info["duration_hr"] = duration if duration is not None else bls_info["duration_hr"]
+
+    scalars = normalize_scalars(bls_info["period"], bls_info["depth_ppm"], bls_info["duration_hr"], csv_path=csv_path)
+
+    X = torch.tensor(vec).unsqueeze(0).unsqueeze(0).to(DEVICE)
+    S = torch.tensor(scalars).unsqueeze(0).to(DEVICE)
+
+    with torch.no_grad():
+        prob = float(model(X, S).cpu().item())
+
+    return prob, bls_info, vec
+
+
+# ── Stellar parameters + physical planet properties ────────────────────────────
+
+STELLAR_CACHE_PATH = "stellar_cache.json"
+
+# Unit conversions
+RSUN_REARTH = 109.2     # solar radii -> Earth radii
+RSUN_AU     = 0.00465047  # solar radii -> AU
+REARTH_RJUP = 1 / 11.2
+ALBEDO      = 0.3       # assumed Bond albedo for Teq
+
+
+def fetch_stellar_params(tic_id: str, cache_path: str = STELLAR_CACHE_PATH) -> dict | None:
+    """Look up stellar radius/mass/Teff for a TIC ID from the MAST TIC catalog. Disk-cached."""
+    cache_file = Path(cache_path)
+    cache = json.loads(cache_file.read_text()) if cache_file.exists() else {}
+
+    if str(tic_id) in cache:
+        return cache[str(tic_id)]
+
+    try:
+        from astroquery.mast import Catalogs
+        table = Catalogs.query_criteria(catalog="Tic", ID=str(tic_id))
+        if len(table) == 0:
+            return None
+        row = table[0]
+        params = {
+            "rad_rsun":  float(row["rad"]),
+            "mass_msun": float(row["mass"]),
+            "teff_k":    float(row["Teff"]),
+        }
+        if any(np.isnan(v) for v in params.values()):
+            return None
+    except Exception:
+        return None
+
+    cache[str(tic_id)] = params
+    cache_file.write_text(json.dumps(cache, indent=2))
+    return params
+
+
+def planet_physical_params(bls_info: dict, stellar: dict) -> dict | None:
+    """Combine BLS transit geometry with stellar params into physical planet properties."""
+    depth = bls_info["depth_ppm"] / 1e6
+    period_days = bls_info["period"]
+    rstar_rsun = stellar["rad_rsun"]
+    mstar_msun = stellar["mass_msun"]
+    teff_k = stellar["teff_k"]
+
+    if depth <= 0 or period_days <= 0 or rstar_rsun <= 0 or mstar_msun <= 0:
+        return None
+
+    rp_rsun = (depth ** 0.5) * rstar_rsun
+    rp_earth = rp_rsun * RSUN_REARTH
+
+    a_au = (mstar_msun * (period_days / 365.25) ** 2) ** (1 / 3)
+    teq_k = teff_k * ((rstar_rsun * RSUN_AU) / (2 * a_au)) ** 0.5 * (1 - ALBEDO) ** 0.25
+    insolation_earth = (rstar_rsun ** 2) * ((teff_k / 5772.0) ** 4) / (a_au ** 2)
+
+    mass_earth = estimate_mass_earth(rp_earth)
+    density_gcm3 = (
+        EARTH_DENSITY_GCM3 * mass_earth / (rp_earth ** 3) if mass_earth is not None else None
+    )
+
+    return {
+        "rp_earth": rp_earth,
+        "rp_jupiter": rp_earth * REARTH_RJUP,
+        "a_au": a_au,
+        "teq_k": teq_k,
+        "insolation_earth": insolation_earth,
+        "mass_earth": mass_earth,
+        "density_gcm3": density_gcm3,
+        "type_label": classify_planet(rp_earth, teq_k),
+    }
+
+
+# ── Mass / density / type estimate (radius-only, no stellar RV needed) ─────────
+#
+# Inverted from Chen & Kipping (2017) forecaster power laws (mass -> radius),
+# solved for mass given radius. Approximate — real mass needs RV or TTVs.
+
+NEPTUNIAN_R_MIN = 1.23   # R_earth, Terran/Neptunian boundary
+JOVIAN_R_MIN    = 14.3   # R_earth, Neptunian/Jovian boundary (mass ill-constrained beyond this)
+EARTH_DENSITY_GCM3 = 5.51
+
+
+def estimate_mass_earth(rp_earth: float) -> float | None:
+    if rp_earth < NEPTUNIAN_R_MIN:
+        return (rp_earth / 1.008) ** (1 / 0.279)
+    if rp_earth < JOVIAN_R_MIN:
+        return (rp_earth / 0.808) ** (1 / 0.589)
+    return None   # gas giant regime: radius barely depends on mass, estimate unreliable
+
+
+def classify_planet(rp_earth: float, teq_k: float) -> str:
+    if rp_earth < 0.8:
+        size = "Sub-Earth"
+    elif rp_earth < 1.25:
+        size = "Earth-like"
+    elif rp_earth < 2.0:
+        size = "Super-Earth"
+    elif rp_earth < 4.0:
+        size = "Sub-Neptune"
+    elif rp_earth < 10.0:
+        size = "Neptune-like"
+    else:
+        size = "Jovian"
+
+    if teq_k >= 1000:
+        return f"Hot {size}"
+    if teq_k < 200:
+        return f"Cold {size}"
+    return size
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -234,54 +408,14 @@ def main():
     model.eval()
     print(f"Loaded model: {model_path}\n")
 
-    import pandas as pd
-    # Check if target is already cached — use cached vector for consistency with training
-    cache_dir = Path(args.cache)
-    npy_path  = cache_dir / f"{args.tic_id}.npy"
-    bls_info  = {}
-
-    if npy_path.exists() and not args.force_download:
-        print(f"Found cached vector for TIC {args.tic_id} — using cache.")
-        vec = np.load(npy_path)
-
-        # Get scalars from CSV if available
-        period, depth_ppm, duration_hr = 0.0, 0.0, 0.0
-        if args.csv and Path(args.csv).exists():
-            df = pd.read_csv(args.csv)
-            df["TIC_ID"] = df["TIC_ID"].astype(str)
-            row = df[df["TIC_ID"] == str(args.tic_id)]
-            if not row.empty:
-                period      = float(row.iloc[0].get("period",      0.0) or 0.0)
-                depth_ppm   = float(row.iloc[0].get("depth_ppm",   0.0) or 0.0)
-                duration_hr = float(row.iloc[0].get("duration_hr", 0.0) or 0.0)
-        period      = args.period    if args.period    is not None else period
-        depth_ppm   = args.depth     if args.depth     is not None else depth_ppm
-        duration_hr = args.duration  if args.duration  is not None else duration_hr
-
-        bls_info = {
-            "period": period, "duration_hr": duration_hr,
-            "depth_ppm": depth_ppm, "sec_depth": float(vec[-2]),
-            "even_odd_diff": float(vec[-1]), "sectors_used": "cached"
-        }
-    else:
-        # Download fresh
-        print(f"Processing TIC {args.tic_id}...")
-        vec, bls_info = process_tic(args.tic_id)
-        if vec is None:
-            print("Could not process light curve. Exiting.")
-            return
-        period      = args.period    if args.period    is not None else bls_info["period"]
-        depth_ppm   = args.depth     if args.depth     is not None else bls_info["depth_ppm"]
-        duration_hr = args.duration  if args.duration  is not None else bls_info["duration_hr"]
-
-    scalars = normalize_scalars(period, depth_ppm, duration_hr, csv_path=args.csv)
-
-    # Run inference — full 264-vec into conv branch, 3 scalars into scalar branch
-    X = torch.tensor(vec).unsqueeze(0).unsqueeze(0).to(DEVICE)   # (1, 1, 264)
-    S = torch.tensor(scalars).unsqueeze(0).to(DEVICE)             # (1, 3)
-
-    with torch.no_grad():
-        prob = float(model(X, S).cpu().item())
+    prob, bls_info, _vec = predict_tic(
+        args.tic_id, model, csv_path=args.csv, cache_dir=args.cache,
+        force_download=args.force_download,
+        period=args.period, depth=args.depth, duration=args.duration,
+    )
+    if prob is None:
+        print("Could not process light curve. Exiting.")
+        return
 
     label = "✅  Planet candidate" if prob >= 0.5 else "❌  False positive"
 

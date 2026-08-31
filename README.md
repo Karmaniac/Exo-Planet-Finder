@@ -58,6 +58,15 @@ python train_classifier.py train --epochs 200 --patience 30 --tess-csv labeled_t
 python inference.py <TIC_ID> --csv labeled_tess_dataset.csv
 ```
 
+### Step 6 — Or classify with the GUI
+```bash
+pip install torch numpy pandas astroquery matplotlib   # + python3-tk (system package, Linux)
+python gui.py
+```
+Enter a TIC ID and hit Classify. Shows the CNN's planet/false-positive call alongside
+estimated physical properties (radius, mass, density, semi-major axis, equilibrium
+temperature, insolation) pulled from the MAST TIC catalog, plus the folded light curve.
+
 ---
 
 ## Labels
