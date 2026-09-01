@@ -29,6 +29,8 @@ from inference import (
 MODEL_PATH = "exoplanet_cnn.pt"
 CSV_PATH = "labeled_tess_dataset.csv"
 CACHE_DIR = "lc_cache"
+# Earth-like x2, Super-Earth, Hot Jovian, Neptune-like
+EXAMPLE_TICS = ["200322593", "101955023", "234994474", "231663901", "266980320"]
 
 
 def _star_color(teff_k: float) -> str:
@@ -49,47 +51,83 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Exoplanet Finder")
-        self.geometry("1020x620")
+        self.geometry("1060x640")
+        self.minsize(900, 560)
+        self.configure(bg="#f4f5f7")
+
+        style = ttk.Style(self)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure(".", background="#f4f5f7", font=("", 10))
+        style.configure("TLabelframe", background="#f4f5f7", padding=10)
+        style.configure("TLabelframe.Label", font=("", 10, "bold"), background="#f4f5f7")
+        style.configure("TFrame", background="#f4f5f7")
+        style.configure("Accent.TButton", font=("", 10, "bold"), padding=8)
 
         self.model = None
 
-        left = ttk.Frame(self, padding=12)
+        left = ttk.Frame(self, padding=14)
         left.pack(side="left", fill="y")
 
-        form = ttk.Frame(left)
+        form = ttk.Labelframe(left, text="Target")
         form.pack(fill="x")
+        form.columnconfigure(1, weight=1)
         ttk.Label(form, text="TIC ID").grid(row=0, column=0, sticky="w")
         self.tic_var = tk.StringVar()
-        ttk.Entry(form, textvariable=self.tic_var, width=16).grid(row=0, column=1, sticky="ew", padx=6)
+        entry = ttk.Entry(form, textvariable=self.tic_var, width=16)
+        entry.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        entry.bind("<Return>", lambda _e: self.on_classify())
 
         self.force_var = tk.BooleanVar()
         ttk.Checkbutton(form, text="Force fresh download",
-                        variable=self.force_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+                        variable=self.force_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        self.run_btn = ttk.Button(left, text="Classify", command=self.on_classify)
-        self.run_btn.pack(pady=8, fill="x")
+        self.run_btn = ttk.Button(left, text="Classify", command=self.on_classify, style="Accent.TButton")
+        self.run_btn.pack(pady=12, fill="x")
 
         self.status_var = tk.StringVar(value=f"Loading model on {DEVICE}...")
-        ttk.Label(left, textvariable=self.status_var, foreground="gray", wraplength=220).pack(fill="x")
+        ttk.Label(left, textvariable=self.status_var, foreground="#555", wraplength=230).pack(fill="x")
 
-        ttk.Label(left, text="BLS transit fit", font=("", 9, "bold")).pack(anchor="w", pady=(14, 0))
-        self.result = tk.Text(left, height=12, width=30, state="disabled")
-        self.result.pack(pady=4, fill="both")
+        result_frame = ttk.Labelframe(left, text="BLS transit fit")
+        result_frame.pack(pady=(14, 0), fill="both", expand=True)
+        self.result = tk.Text(result_frame, height=12, width=32, state="disabled",
+                               font=("Courier New", 10), relief="flat", bg="#ffffff",
+                               padx=8, pady=8, borderwidth=0)
+        self.result.pack(fill="both", expand=True)
 
-        right = ttk.Frame(self, padding=(0, 12, 12, 12))
-        right.pack(side="left", fill="both", expand=True)
+        middle = ttk.Frame(self, padding=(0, 14, 8, 14))
+        middle.pack(side="left", fill="both", expand=True)
 
-        self.fig = Figure(figsize=(8.0, 5.6), dpi=100)
-        gs = self.fig.add_gridspec(2, 3, width_ratios=[3, 3, 1.3], height_ratios=[1, 1])
-        self.ax_main = self.fig.add_subplot(gs[:, :2])
-        self.ax_global = self.fig.add_subplot(gs[0, 2])
-        self.ax_local = self.fig.add_subplot(gs[1, 2])
+        sidebar = ttk.Frame(self, padding=(0, 14, 14, 14))
+        sidebar.pack(side="left", fill="y")
+
+        self.fig_main = Figure(figsize=(5.6, 5.6), dpi=100, facecolor="#f4f5f7")
+        self.ax_main = self.fig_main.add_subplot(111)
+        self.canvas_main = FigureCanvasTkAgg(self.fig_main, master=middle)
+        self.canvas_main.get_tk_widget().pack(fill="both", expand=True)
+
+        self.fig_curves = Figure(figsize=(3.2, 4.2), dpi=100, facecolor="#f4f5f7")
+        gs = self.fig_curves.add_gridspec(2, 1, hspace=0.7)
+        self.ax_global = self.fig_curves.add_subplot(gs[0])
+        self.ax_local = self.fig_curves.add_subplot(gs[1])
+        self.canvas_curves = FigureCanvasTkAgg(self.fig_curves, master=sidebar)
+        self.canvas_curves.get_tk_widget().pack(side="top", fill="x")
+
         self._reset_plot()
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
-        self.canvas.get_tk_widget().pack(fill="both", expand=True)
+        examples = ttk.Labelframe(sidebar, text="Example TICs")
+        examples.pack(side="top", fill="both", expand=True, pady=(14, 0))
+        for i, tic in enumerate(EXAMPLE_TICS):
+            ttk.Button(examples, text=f"TIC {tic}",
+                       command=lambda t=tic: self._load_example(t)).grid(
+                row=i, column=0, padx=6, pady=6, sticky="ew")
+        examples.columnconfigure(0, weight=1)
 
         self.after(100, self.load_model)
+
+    def _load_example(self, tic_id: str):
+        self.tic_var.set(tic_id)
+        self.on_classify()
 
     # ── Model loading ───────────────────────────────────────────────────────
 
@@ -118,7 +156,8 @@ class App(tk.Tk):
         self.status_var.set(f"Processing TIC {tic_id}...")
         self._write("")
         self._reset_plot()
-        self.canvas.draw()
+        self.canvas_main.draw()
+        self.canvas_curves.draw()
         threading.Thread(target=self._classify, args=(tic_id,), daemon=True).start()
 
     def _classify(self, tic_id: str):
@@ -168,7 +207,8 @@ class App(tk.Tk):
             ax.set_title(title, fontsize=9)
             ax.set_xticks([])
             ax.set_yticks([])
-        self.fig.tight_layout()
+        self.fig_main.tight_layout()
+        self.fig_curves.tight_layout()
 
     def _update_plot(self, tic_id, prob, bls_info, vec: np.ndarray, phys, stellar):
         global_view = vec[:201]
@@ -183,6 +223,9 @@ class App(tk.Tk):
         self.ax_local.plot(np.linspace(-1, 1, len(local_view)), local_view, lw=0.7, color="tab:orange")
         self.ax_local.set_title("Transit zoom", fontsize=9)
         self.ax_local.tick_params(labelsize=6)
+
+        self.fig_curves.tight_layout()
+        self.canvas_curves.draw()
 
         ax = self.ax_main
         ax.clear()
@@ -203,8 +246,8 @@ class App(tk.Tk):
         if not phys:
             ax.text(0.5, 0.5, "Stellar parameters unavailable\n(no radius/mass/temperature estimate)",
                     ha="center", va="center", fontsize=10, transform=ax.transAxes)
-            self.fig.tight_layout()
-            self.canvas.draw()
+            self.fig_main.tight_layout()
+            self.canvas_main.draw()
             return
 
         # Host star backdrop (visually compressed — not to scale)
@@ -243,8 +286,8 @@ class App(tk.Tk):
         ax.text(0.02, 0.20, info, ha="left", va="top", fontsize=9, family="monospace",
                 transform=ax.transAxes)
 
-        self.fig.tight_layout()
-        self.canvas.draw()
+        self.fig_main.tight_layout()
+        self.canvas_main.draw()
 
     def _write(self, text: str):
         self.result.configure(state="normal")
