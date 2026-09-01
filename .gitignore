@@ -16,3 +16,5 @@ lc_cache_old/
 kepler_cache_old/
 kepler_cache/
 lc_cache/
+stellar_cache.json
+non_hot_jovian_tics.txt
