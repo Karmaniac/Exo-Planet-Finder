@@ -2,19 +2,19 @@
 fetch_astronet_dataset.py
 ─────────────────────────
 Downloads the Astronet-Triage tces.csv from GitHub and converts it into
-the labeled_tess_dataset.csv format used by train_classifier.py download.
+the data/labeled_tess_dataset.csv format used by train_classifier.py download.
 
 Labels:
   PC (planet candidate) = 1
   EB, IS, V, O, J       = 0  (all false positive / non-planet classes)
 
 Output:
-  astronet_tess_dataset.csv — ready to feed into train_classifier.py download
+  data/astronet_tess_dataset.csv — ready to feed into train_classifier.py download
 
 Usage:
   python fetch_astronet_dataset.py
-  python fetch_astronet_dataset.py --exclude-existing labeled_tess_dataset.csv
-  python fetch_astronet_dataset.py --max-targets 2000 --exclude-existing labeled_tess_dataset.csv
+  python fetch_astronet_dataset.py --exclude-existing data/labeled_tess_dataset.csv
+  python fetch_astronet_dataset.py --max-targets 2000 --exclude-existing data/labeled_tess_dataset.csv
 """
 
 import argparse
@@ -29,8 +29,8 @@ TCES_URL = "https://raw.githubusercontent.com/yuliang419/Astronet-Triage/master/
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out",              type=str, default="astronet_tess_dataset.csv",
-                        help="Output CSV path (default: astronet_tess_dataset.csv)")
+    parser.add_argument("--out",              type=str, default="data/astronet_tess_dataset.csv",
+                        help="Output CSV path (default: data/astronet_tess_dataset.csv)")
     parser.add_argument("--exclude-existing", type=str, default=None,
                         help="Existing labeled CSV — TIC IDs already in there will be excluded")
     parser.add_argument("--max-targets",      type=int, default=None,

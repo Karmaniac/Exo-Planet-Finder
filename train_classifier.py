@@ -7,8 +7,8 @@ Two-phase workflow
 ──────────────────
   Phase 1 — Download & cache processed light curves (network-heavy, slow):
 
-    python train_classifier.py download --csv labeled_tess_dataset.csv
-    python fetch_astronet_dataset.py --exclude-existing labeled_tess_dataset.csv
+    python train_classifier.py download --csv data/labeled_tess_dataset.csv
+    python fetch_astronet_dataset.py --exclude-existing data/labeled_tess_dataset.csv
 
     Outputs a cache directory (default: lc_cache/) containing:
       <TIC_ID>.npy   — 264-element float32 vector per target
@@ -16,7 +16,7 @@ Two-phase workflow
 
   Phase 2 — Train from cache:
 
-    python train_classifier.py train --epochs 200 --patience 40 --batch-size 32 --tess-csv labeled_tess_dataset.csv
+    python train_classifier.py train --epochs 200 --patience 40 --batch-size 32 --tess-csv data/labeled_tess_dataset.csv
 
     You can retrain as many times as you want without re-downloading.
 
@@ -53,8 +53,8 @@ from torch.utils.data import DataLoader, TensorDataset
 warnings.filterwarnings("ignore")
 
 RANDOM_SEED   = 42
-MODEL_PATH    = "exoplanet_cnn.pt"
-META_PATH     = "exoplanet_cnn_meta.json"
+MODEL_PATH    = "models/exoplanet_cnn.pt"
+META_PATH     = "models/exoplanet_cnn_meta.json"
 GLOBAL_BINS   = 201
 LOCAL_BINS    = 61
 INPUT_SIZE    = GLOBAL_BINS + LOCAL_BINS + 2   # 264 (+ secondary eclipse depth, even/odd diff)
@@ -567,8 +567,8 @@ def main():
         epilog="""
 Examples:
   # Download & cache light curves
-  python train_classifier.py download --csv labeled_tess_dataset.csv
-  python train_classifier.py download --csv labeled_tess_dataset.csv --max-targets 200
+  python train_classifier.py download --csv data/labeled_tess_dataset.csv
+  python train_classifier.py download --csv data/labeled_tess_dataset.csv --max-targets 200
 
   # Train from cache (repeatable, no network needed)
   python train_classifier.py train
@@ -584,8 +584,8 @@ Examples:
 
     # ── download subcommand ──
     dl = sub.add_parser("download", help="Fetch & cache processed light curves to disk.")
-    dl.add_argument("--csv",         type=str, default="labeled_tess_dataset.csv",
-                    help="Labeled dataset CSV (default: labeled_tess_dataset.csv)")
+    dl.add_argument("--csv",         type=str, default="data/labeled_tess_dataset.csv",
+                    help="Labeled dataset CSV (default: data/labeled_tess_dataset.csv)")
     dl.add_argument("--cache",       type=str, default=DEFAULT_CACHE,
                     help=f"Cache directory (default: {DEFAULT_CACHE})")
     dl.add_argument("--max-targets", type=int, default=None,
@@ -600,9 +600,9 @@ Examples:
     tr.add_argument("--epochs",         type=int,   default=50)
     tr.add_argument("--batch-size",     type=int,   default=32)
     tr.add_argument("--lr",             type=float, default=1e-3)
-    tr.add_argument("--tess-csv",        type=str,   default="labeled_tess_dataset.csv",
+    tr.add_argument("--tess-csv",        type=str,   default="data/labeled_tess_dataset.csv",
                     help="TESS labeled CSV for scalar features")
-    tr.add_argument("--kepler-csv",      type=str,   default="labeled_kepler_dataset.csv",
+    tr.add_argument("--kepler-csv",      type=str,   default="data/labeled_kepler_dataset.csv",
                     help="Kepler labeled CSV for scalar features")
     tr.add_argument("--patience",        type=int,   default=15,
                     help="Early stopping patience in epochs (default: 15)")

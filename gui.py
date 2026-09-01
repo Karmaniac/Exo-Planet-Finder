@@ -26,8 +26,8 @@ from inference import (
     DEVICE, ExoplanetCNN, fetch_stellar_params, planet_physical_params, predict_tic,
 )
 
-MODEL_PATH = "exoplanet_cnn.pt"
-CSV_PATH = "labeled_tess_dataset.csv"
+MODEL_PATH = "models/exoplanet_cnn.pt"
+CSV_PATH = "data/labeled_tess_dataset.csv"
 CACHE_DIR = "lc_cache"
 # Earth-like x2, Super-Earth, Hot Jovian, Neptune-like
 EXAMPLE_TICS = ["200322593", "101955023", "234994474", "231663901", "266980320"]

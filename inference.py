@@ -182,7 +182,7 @@ def process_tic(tic_id: str) -> tuple[np.ndarray | None, dict]:
 # ── Scalar normalization (approximate — uses typical TESS dataset stats) ───────
 
 # These are approximate log-scale means/stds derived from the TESS training set.
-# If you have the labeled_tess_dataset.csv handy, pass --csv to compute exactly.
+# If you have the data/labeled_tess_dataset.csv handy, pass --csv to compute exactly.
 # Approximate fallback stats — pass --csv for exact normalization
 SCALAR_MEAN = np.array([1.5, 8.5, 2.8], dtype=np.float32)
 SCALAR_STD  = np.array([1.2, 2.1, 1.6], dtype=np.float32)
@@ -213,7 +213,7 @@ def normalize_scalars(period: float, depth_ppm: float, duration_hr: float,
 
 # ── Shared prediction logic (used by CLI and the GUI) ──────────────────────────
 
-def predict_tic(tic_id: str, model: "ExoplanetCNN", csv_path: str = "labeled_tess_dataset.csv",
+def predict_tic(tic_id: str, model: "ExoplanetCNN", csv_path: str = "data/labeled_tess_dataset.csv",
                 cache_dir: str = "lc_cache", force_download: bool = False,
                 period: float = None, depth: float = None, duration: float = None) -> tuple[float, dict]:
     """Run the full feature pipeline + model for a TIC ID. Returns (probability, bls_info)."""
@@ -379,9 +379,9 @@ def classify_planet(rp_earth: float, teq_k: float) -> str:
 def main():
     parser = argparse.ArgumentParser(description="CNN exoplanet inference on a TESS TIC target.")
     parser.add_argument("tic_id",          type=str,   help="TIC ID to classify")
-    parser.add_argument("--model",         type=str,   default="exoplanet_cnn.pt",
-                        help="Path to saved model weights (default: exoplanet_cnn.pt)")
-    parser.add_argument("--csv",           type=str,   default="labeled_tess_dataset.csv",
+    parser.add_argument("--model",         type=str,   default="models/exoplanet_cnn.pt",
+                        help="Path to saved model weights (default: models/exoplanet_cnn.pt)")
+    parser.add_argument("--csv",           type=str,   default="data/labeled_tess_dataset.csv",
                         help="Labeled TESS CSV for accurate scalar normalization")
     parser.add_argument("--period",        type=float, default=None,
                         help="Override BLS period (days) — skips download if all 3 provided")

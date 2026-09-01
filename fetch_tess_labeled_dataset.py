@@ -199,8 +199,8 @@ def main():
     parser = argparse.ArgumentParser(description="Build a labeled TESS exoplanet dataset.")
     parser.add_argument("--max-targets", type=int, default=None,
                         help="Limit number of targets to query (default: all)")
-    parser.add_argument("--output", type=str, default="labeled_tess_dataset.csv",
-                        help="Output CSV filename (default: labeled_tess_dataset.csv)")
+    parser.add_argument("--output", type=str, default="data/labeled_tess_dataset.csv",
+                        help="Output CSV filename (default: data/labeled_tess_dataset.csv)")
     parser.add_argument("--skip-sectors", action="store_true",
                         help="Skip sector fetching (just save labels from TOI table)")
     parser.add_argument("--no-balance", action="store_true",
