@@ -78,7 +78,7 @@ class App(tk.Tk):
         entry.grid(row=0, column=1, sticky="ew", padx=(6, 0))
         entry.bind("<Return>", lambda _e: self.on_classify())
 
-        self.force_var = tk.BooleanVar()
+        self.force_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(form, text="Force fresh download",
                         variable=self.force_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
